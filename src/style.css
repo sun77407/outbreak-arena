@@ -478,9 +478,11 @@ input[type=range] {
 #minimap-canvas { width: 100%; height: 100%; display: block; }
 
 /* Kill feed */
+/* Bug #10 fix: moved to below the minimap (5rem top + 180px height + 8px gap) */
 .kill-feed {
   position: absolute;
-  top: 6rem; right: 1.5rem;
+  top: calc(5rem + 194px);
+  right: 1.5rem;
   display: flex; flex-direction: column; gap: 0.4rem;
   max-width: 260px;
   pointer-events: none;
@@ -622,7 +624,7 @@ input[type=range] {
 .spinner-name {
   font-size: 3rem;
   font-weight: 800;
-  color: var(--text-color);
+  color: var(--text-primary);  /* Bug #20 fix: was --text-color which is undefined */
   margin-top: 2rem;
   padding: 1rem;
   border-radius: 12px;
@@ -713,7 +715,8 @@ input[type=range] {
   /* Chat panel: left-aligned on small screens to avoid joystick zone overlap */
   .chat-panel { width: 55vw; bottom: 1rem; left: 45%; transform: translateX(-50%); }
   .minimap-wrap { width: 110px; height: 110px; top: 4rem; right: 0.75rem; }
-  .kill-feed { max-width: 40vw; top: 3.5rem; right: 0.5rem; }
+  /* Bug #10 fix: kill-feed below minimap on mobile too */
+  .kill-feed { max-width: 40vw; top: calc(4rem + 120px); right: 0.5rem; }
   .action-buttons { bottom: 1rem; right: 1rem; transform: scale(0.85); transform-origin: bottom right; }
   #joystick-zone { width: 42%; height: 42%; bottom: 0; left: 0; }
   .top-hud { padding: 0.5rem; }

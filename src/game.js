@@ -51,6 +51,9 @@ export class Game {
     this.roundEndTime = 0;
     this._lastCountdownBeep = -1;
     this.spectateIndex = 0;
+    // Ghost-clone guard: prevent handleSnapshot from auto-spawning players
+    // before world assets have finished loading (see game.start())
+    this._gameInitialized = false;
 
     // Server tick tracking for interpolation
     this.serverTick = 0;
@@ -123,17 +126,31 @@ export class Game {
     this.updateHUD();
     this.updateActionButtons();
 
+    // Mark init complete BEFORE starting the render loop so that
+    // handleSnapshot can now safely auto-spawn late-joining players.
+    this._gameInitialized = true;
     this.isRunning = true;
     this.isPaused = false;
     this.renderer.setAnimationLoop(this.animate.bind(this));
 
-    window.addEventListener('wheel', (e) => { this.applyZoom(e.deltaY > 0 ? 1 : -1, 0.5); });
+    // Bug #21 fix: store handler reference so it can be removed in stop()
+    this._wheelHandler = (e) => { this.applyZoom(e.deltaY > 0 ? 1 : -1, 0.5); };
+    window.addEventListener('wheel', this._wheelHandler);
     document.getElementById('btn-zoom-in')?.addEventListener('click', () => this.applyZoom(-1, 2.0));
     document.getElementById('btn-zoom-out')?.addEventListener('click', () => this.applyZoom(1, 2.0));
     this.setupPinchZoom();
   }
 
   spawnPlayer(id, role, position = null, playerNames = null) {
+    // Ghost-clone guard: if a player was auto-spawned from an early snapshot
+    // (before world assets finished loading), their orphaned 3D group is still
+    // in the scene. Destroy it before creating the real instance.
+    const existing = this.players.get(id);
+    if (existing) {
+      existing.destroy();
+      this.players.delete(id);
+    }
+
     // Resolve display name: from initialState.playerNames array, or network map
     let dName = this.network.playerNames.get(id) || `Player ${id.slice(0, 4)}`;
     if (playerNames) {
@@ -194,6 +211,11 @@ export class Game {
     this.audio.stopAll();
     this.players.forEach((p) => p.destroy());
     this.players.clear();
+    // Bug #21 fix: remove the wheel zoom listener to prevent accumulation across sessions
+    if (this._wheelHandler) {
+      window.removeEventListener('wheel', this._wheelHandler);
+      this._wheelHandler = null;
+    }
     this.container.innerHTML = '';
   }
 
@@ -231,8 +253,17 @@ export class Game {
     this.serverTick = data.tick;
 
     for (const state of data.players) {
-      const player = this.players.get(state.id);
-      if (!player) continue;
+      let player = this.players.get(state.id);
+
+      // Auto-spawn guard: only spawn players mid-game AFTER initial loading is complete.
+      // During the async world.init() window, snapshots arrive but world.assets are not
+      // ready yet — spawning now would create broken orphan objects that become ghost clones.
+      if (!player) {
+        if (!this._gameInitialized) continue;   // loading still in progress — skip
+        if (state.id === this.localPlayerId) continue;
+        player = this.spawnPlayer(state.id, state.role || 'survivor', null, null);
+        if (state.x !== undefined) player.group.position.set(state.x, 0, state.z);
+      }
 
       if (state.id === this.localPlayerId) {
         // Reconcile local prediction with server position
@@ -278,10 +309,21 @@ export class Game {
       case 'role_changed': {
         const p = this.players.get(data.playerId);
         if (p && p.role !== data.role) {
-          // Server confirms a role change (after infect delay)
-          if (data.role === 'zombie' && p.isDead) {
-            // The infect() timeout already handles the visual; just sync role
-            p.role = 'zombie';
+          // Bug #7 fix: always call setModel() to switch the 3D character mesh.
+          // Previously this only ran when p.isDead, missing cases where the infect()
+          // 2s timeout already finished but model was never switched server-side.
+          if (data.role === 'zombie') {
+            if (p.isDead) {
+              // infect() timeout is still in progress — just sync the role property;
+              // the setTimeout inside infect() will call setModel() when it fires.
+              p.role = 'zombie';
+            } else {
+              // infect() timeout already completed — force model switch now.
+              p.setModel('zombie');
+              p.playAnimation('idle');
+            }
+          } else {
+            p.role = data.role;
           }
           this.updateHUD();
         }
@@ -467,7 +509,8 @@ export class Game {
 
     let trapId = null;
     if (type === 'trap') {
-      trapId = 'trap_' + Math.random().toString(36).substring(7);
+      // Bug #16 fix: use full mantissa of random string for sufficient entropy
+      trapId = 'trap_' + Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
       // Optimistic: spawn trap visually immediately on own client
       this.world.spawnTrap(trapId, localPlayer.group.position.x, localPlayer.group.position.z, localPlayer.role, false);
     }
@@ -505,7 +548,9 @@ export class Game {
   updateSpectatorBanner() {
     const local = this.players.get(this.localPlayerId);
     if (!this.spectatorBannerEl) return;
-    const spectating = local && (local.isExtracted || (local.isDead && local.role !== 'zombie'));
+    // Bug #22 fix: show banner whenever local player is dead (including the 2s infect
+    // transition where isDead=true but role may already be 'zombie') or extracted.
+    const spectating = local && (local.isExtracted || local.isDead);
     this.spectatorBannerEl.classList.toggle('hidden', !spectating);
   }
 

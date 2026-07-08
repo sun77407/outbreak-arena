@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
@@ -259,6 +260,7 @@ function gameTick(room) {
   for (const [, p] of room.players) {
     snapshot.players.push({
       id: p.id,
+      tick: room.tick,   // Bug #3 fix: per-player tick needed for client interpolation
       x: p.x, z: p.z, rotY: p.rotY,
       role: p.role,
       isDead: p.isDead,
@@ -344,6 +346,8 @@ function endGame(room, result) {
   room.gameRunning = false;
   clearInterval(room.gameLoopTimer);
   room.gameLoopTimer = null;
+  // Bug #5 fix: clear ping interval when game ends
+  if (room.pingInterval) { clearInterval(room.pingInterval); room.pingInterval = null; }
   broadcast(room.clients, { type: 'game_end', result });
 }
 
@@ -354,6 +358,7 @@ function closeRoom(code, reason) {
   const room = rooms.get(code);
   if (!room) return;
   if (room.gameLoopTimer) clearInterval(room.gameLoopTimer);
+  if (room.pingInterval) clearInterval(room.pingInterval);
   broadcast(room.clients, { type: 'host_disconnected' });
   rooms.delete(code);
   console.log(`Room ${code} closed (${reason})`);
@@ -363,7 +368,8 @@ function closeRoom(code, reason) {
 // WebSocket connection handler
 // ---------------------------------------------------------------------------
 wss.on('connection', (ws) => {
-  ws.playerId = Math.random().toString(36).substr(2, 9);
+  // Bug #2 fix: use cryptographically-secure server-generated ID (16 hex chars)
+  ws.playerId = crypto.randomBytes(8).toString('hex');
   ws.roomCode = null;
   ws.isAlive = true;
 
@@ -378,7 +384,7 @@ wss.on('connection', (ws) => {
 
         // ---- Lobby ----
         case 'create_room': {
-          if (data.myId) ws.playerId = data.myId;
+          // Bug #2 fix: server assigns the canonical ID, ignoring client suggestion
           const code = generateRoomCode();
           ws.roomCode = code;
           const room = {
@@ -393,8 +399,10 @@ wss.on('connection', (ws) => {
             powerups: new Map(),
             traps: new Map(),
             gameLoopTimer: null,
+            pingInterval: null,   // Bug #5 fix: stored on room for proper cleanup
             powerupTimer: 5,
             _powerupIdCounter: 0,
+            hostId: ws.playerId,  // Bug #19 fix: track who can start the game
           };
           rooms.set(code, room);
           safeSend(ws, { type: 'room_created', code, yourId: ws.playerId });
@@ -403,7 +411,7 @@ wss.on('connection', (ws) => {
         }
 
         case 'join_room': {
-          if (data.myId) ws.playerId = data.myId;
+          // Bug #2 fix: server uses its own assigned ID, ignores client's suggestion
           const code = String(data.code || '').toUpperCase();
           const room = rooms.get(code);
           if (!room) { safeSend(ws, { type: 'error', message: 'Room not found.' }); return; }
@@ -428,8 +436,8 @@ wss.on('connection', (ws) => {
             safeSend(ws, { type: 'game_start', initialState: syncState });
           }
 
-          // Tell everyone else a new player joined
-          broadcast(room.clients, { type: 'peer_joined', id: ws.playerId, name: newPlayer.name }, ws.playerId);
+          // Bug #9 fix: include role so clients can spawn with the correct model
+          broadcast(room.clients, { type: 'peer_joined', id: ws.playerId, name: newPlayer.name, role: newPlayer.role }, ws.playerId);
           console.log(`Player ${ws.playerId} joined room ${code}`);
           break;
         }
@@ -437,6 +445,8 @@ wss.on('connection', (ws) => {
         case 'start_game': {
           const room = rooms.get(ws.roomCode);
           if (!room || room.gameRunning) return;
+          // Bug #19 fix: only the host can start the game
+          if (ws.playerId !== room.hostId) { safeSend(ws, { type: 'error', message: 'Only the host can start the game.' }); return; }
           if (room.players.size < 2) { safeSend(ws, { type: 'error', message: 'Need at least 2 players.' }); return; }
 
           startGame(room, data.roundTime || 180, data.useSpinner !== false);
@@ -496,6 +506,7 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const room = rooms.get(ws.roomCode);
     if (!room) return;
+    const wasHost = (ws.playerId === room.hostId);
     room.players.delete(ws.playerId);
     room.clients.delete(ws);
     broadcast(room.clients, { type: 'peer_left', id: ws.playerId });
@@ -503,6 +514,14 @@ wss.on('connection', (ws) => {
 
     if (room.players.size === 0) {
       closeRoom(ws.roomCode, 'all players left');
+    } else if (wasHost) {
+      // Promote another player to host
+      room.hostId = room.players.keys().next().value;
+      const newHostPlayer = room.players.get(room.hostId);
+      if (newHostPlayer) {
+        safeSend(newHostPlayer.ws, { type: 'host_promoted', yourId: room.hostId });
+        console.log(`Host promoted to ${room.hostId} in room ${ws.roomCode}`);
+      }
     }
   });
 
@@ -560,9 +579,9 @@ function startGame(room, roundTime, useSpinner) {
   const msgType = useSpinner ? 'start_spinner' : 'game_start';
   broadcast(room.clients, { type: msgType, initialState });
 
-  // Start ping loop (every 2s)
-  const pingInterval = setInterval(() => {
-    if (!room.gameRunning && room.players.size === 0) { clearInterval(pingInterval); return; }
+  // Bug #5 fix: store ping interval on room so endGame() can clear it
+  room.pingInterval = setInterval(() => {
+    if (!room.gameRunning) { clearInterval(room.pingInterval); room.pingInterval = null; return; }
     broadcast(room.clients, { type: 'ping', t: Date.now() });
   }, 2000);
 

@@ -100,7 +100,11 @@ export class NetworkManager {
 
       case 'room_created':
         this.roomCode = data.code;
-        this.myId = data.yourId || this.myId;
+        // Bug #2 fix: server now assigns canonical IDs — update and clean up old local entry
+        if (data.yourId && data.yourId !== this.myId) {
+          this.playerNames.delete(this.myId);
+          this.myId = data.yourId;
+        }
         this.isHost = true;   // first player in room — can start the game
         this.playerNames.set(this.myId, this.myName);
         if (this.onRoomCreated) this.onRoomCreated(this.roomCode);
@@ -108,7 +112,11 @@ export class NetworkManager {
 
       case 'room_joined':
         this.roomCode = data.code;
-        this.myId = data.yourId || this.myId;
+        // Bug #2 fix: server now assigns canonical IDs — update and clean up old local entry
+        if (data.yourId && data.yourId !== this.myId) {
+          this.playerNames.delete(this.myId);
+          this.myId = data.yourId;
+        }
         this.isHost = false;
         // Populate names from existing players
         (data.players || []).forEach(p => this.playerNames.set(p.id, p.name));
@@ -119,7 +127,8 @@ export class NetworkManager {
 
       case 'peer_joined':
         this.playerNames.set(data.id, data.name || `Player ${data.id.slice(0, 4)}`);
-        if (this.onPeerJoined) this.onPeerJoined(data.id);
+        // Bug #9 fix: forward role so main.js can spawn with the correct model
+        if (this.onPeerJoined) this.onPeerJoined(data.id, data.role || 'survivor');
         if (this.onLobbySync) this.onLobbySync();
         break;
 
@@ -127,6 +136,14 @@ export class NetworkManager {
         this.playerNames.delete(data.id);
         if (this.onPeerLeft) this.onPeerLeft(data.id);
         if (this.onLobbySync) this.onLobbySync();
+        break;
+
+      case 'host_promoted':
+        // Server promoted us to host after the previous host left
+        this.isHost = true;
+        if (this.onSignalingStatus) this.onSignalingStatus('connected');
+        // Notify main.js so it can show the start button
+        if (this.onRoomCreated) this.onRoomCreated(this.roomCode);
         break;
 
       case 'host_disconnected':

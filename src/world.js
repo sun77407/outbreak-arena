@@ -365,10 +365,7 @@ export class World {
 
     for (const c of this.colliders) {
       if (c.type === 'sphere' && c.center) {
-        const dist = pos.distanceTo(c.center);
-        if (dist < radius + c.radius) return true;
-      } else if (c.radius && c.center) {
-        // legacy sphere format
+        // Bug #17 fix: removed unreachable legacy else-if (was dead code)
         const dist = pos.distanceTo(c.center);
         if (dist < radius + c.radius) return true;
       } else if (c.type === 'box') {

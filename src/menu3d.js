@@ -6,12 +6,12 @@ export class Menu3D {
     this.container = document.getElementById(containerId);
     this.scene = new THREE.Scene();
 
-    // Dark grey exactly matching Kenney reference image
-    this.scene.background = new THREE.Color(0x3a3a40);
+    // Bug #4 fix: use game background color to eliminate obvious grey whitespace
+    this.scene.background = new THREE.Color(0x0f172a);
 
-    // True Isometric Orthographic Camera
+    // Bug #4 fix: reduce d from 10→6 to zoom in and fill more of the viewport
     const aspect = window.innerWidth / window.innerHeight;
-    const d = 10;
+    const d = 6;
     this.camera = new THREE.OrthographicCamera(-d * aspect, d * aspect, d, -d, 0.1, 1000);
     // Position set later after cluster offset is known
 
@@ -45,14 +45,14 @@ export class Menu3D {
     // Tiled checkerboard floor like the reference image
     this._buildFloor();
 
-    // The main cluster group - pushed FAR right so the left side is clear for UI
+    // Bug #4 fix: cluster brought closer to view center so models fill the right half
     this.cluster = new THREE.Group();
-    this.cluster.position.set(10, 0, 0);
+    this.cluster.position.set(3, 0, 0);
     this.scene.add(this.cluster);
 
-    // Camera: isometric angle looking at the right-center area where cluster lives
-    this.camera.position.set(28, 22, 28);
-    this.camera.lookAt(8, 0, 8);
+    // Camera: isometric angle — zoomed in to fill the right 50% of screen with content
+    this.camera.position.set(18, 14, 18);
+    this.camera.lookAt(3, 0, 3);
 
     this.mixers = [];
     this.loader = new GLTFLoader();
@@ -211,7 +211,7 @@ export class Menu3D {
 
   handleResize() {
     const aspect = window.innerWidth / window.innerHeight;
-    const d = 10;
+    const d = 6;  // Bug #4 fix: keep in sync with constructor
     this.camera.left = -d * aspect;
     this.camera.right = d * aspect;
     this.camera.top = d;
@@ -234,6 +234,16 @@ export class Menu3D {
     this.active = false;
     window.removeEventListener('resize', this.onResize);
     if (this.renderer) {
+      // Bug #14 fix: dispose all Three.js GPU resources to prevent memory leaks
+      // (1600 floor tile geometries + materials + character textures)
+      this.mixers.forEach(m => m.stopAllAction());
+      this.scene.traverse((object) => {
+        if (object.isMesh) {
+          object.geometry.dispose();
+          const mats = Array.isArray(object.material) ? object.material : [object.material];
+          mats.forEach(m => { if (m) m.dispose(); });
+        }
+      });
       this.renderer.dispose();
       this.container.innerHTML = '';
     }

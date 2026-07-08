@@ -85,7 +85,7 @@ function init() {
     updatePlayerList();
   };
 
-  network.onPeerJoined = (peerId) => {
+  network.onPeerJoined = (peerId, peerRole) => {
     updatePlayerList();
     showToast('A survivor joined the lobby.');
     // Count players — in the new model anyone who's in the room can start,
@@ -97,11 +97,10 @@ function init() {
       btnStartMatch.textContent = 'Start Match';
     }
 
-    // If game is already running, server handles sending the late-join game_start.
-    // We just need to locally spawn the player if they appear via peer_joined mid-game.
+    // Bug #9 fix: use the correct role forwarded from the peer_joined message
     if (game && game.isRunning && !game.players.has(peerId)) {
       const name = network.playerNames.get(peerId) || `Player ${peerId.slice(0, 4)}`;
-      game.spawnPlayer(peerId, 'survivor', null, [{ id: peerId, name }]);
+      game.spawnPlayer(peerId, peerRole || 'survivor', null, [{ id: peerId, name }]);
       game.updateHUD();
     }
   };
