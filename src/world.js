@@ -20,6 +20,14 @@ export class World {
     this.mapProps = [];
     this.safeZoneRing = null;
     this._clock = 0;
+    
+    this.powerups = new Map();
+    // No longer using octahedron for powerups, will use glowing pumpkin
+
+    this.traps = new Map();
+    this.trapGeo = new THREE.PlaneGeometry(1.5, 1.5);
+    this.trapMatSurvivor = new THREE.MeshBasicMaterial({ color: 0x10b981, transparent: true, opacity: 0.4, depthWrite: false });
+    this.trapMatZombie = new THREE.MeshBasicMaterial({ color: 0xef4444, transparent: true, opacity: 0.4, depthWrite: false });
   }
 
   async init(onProgress) {
@@ -30,25 +38,26 @@ export class World {
     await this.buildArena();
 
     onProgress?.('Lighting the scene...');
-    const ambientLight = new THREE.AmbientLight(0x223344, 1.5);
+    const ambientLight = new THREE.AmbientLight(0x4a3a6a, 2.2);
     this.scene.add(ambientLight);
 
-    const dirLight = new THREE.DirectionalLight(0x7788aa, 2);
-    dirLight.position.set(10, 20, 10);
+    const dirLight = new THREE.DirectionalLight(0xffddaa, 2.8);
+    dirLight.position.set(15, 25, 10);
     dirLight.castShadow = true;
     dirLight.shadow.mapSize.width = 2048;
     dirLight.shadow.mapSize.height = 2048;
     dirLight.shadow.camera.near = 0.5;
-    dirLight.shadow.camera.far = 50;
-    dirLight.shadow.camera.left = -20;
-    dirLight.shadow.camera.right = 20;
-    dirLight.shadow.camera.top = 20;
-    dirLight.shadow.camera.bottom = -20;
+    dirLight.shadow.camera.far = 60;
+    dirLight.shadow.camera.left = -25;
+    dirLight.shadow.camera.right = 25;
+    dirLight.shadow.camera.top = 25;
+    dirLight.shadow.camera.bottom = -25;
+    dirLight.shadow.bias = -0.0005;
     this.scene.add(dirLight);
 
     // Ground
     const groundGeo = new THREE.PlaneGeometry(60, 60);
-    const groundMat = new THREE.MeshStandardMaterial({ color: 0x1a2a1a, roughness: 0.9, metalness: 0.1 });
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x3d3a4e, roughness: 1.0, metalness: 0.0 });
     const ground = new THREE.Mesh(groundGeo, groundMat);
     ground.rotation.x = -Math.PI / 2;
     ground.receiveShadow = true;
@@ -65,20 +74,20 @@ export class World {
     const zombieGltf = await this.loader.loadAsync('/assets/Models/GLB format/character-zombie.glb');
     this.assets.zombieModel = zombieGltf.scene;
 
+    const pumpkinGltf = await this.loader.loadAsync('/assets/Models/GLB format/pumpkin.glb');
+    this.assets.pumpkinModel = pumpkinGltf.scene;
+
     this.assets.animations = survivorGltf.animations;
   }
 
   async buildArena() {
     const graveGltf = await this.loader.loadAsync('/assets/Models/GLB format/gravestone-cross.glb');
     const treeGltf = await this.loader.loadAsync('/assets/Models/GLB format/pine.glb');
+    const fallTreeGltf = await this.loader.loadAsync('/assets/Models/GLB format/pine-fall.glb');
+    const pumpkinGltf = this.assets.pumpkinModel;
 
-    // Batch obstacles with InstancedMesh where the source model is a single mesh,
-    // falling back to normal cloning for rigged/multi-mesh props. This keeps draw
-    // calls low even with a large scatter count.
-    this.scatterObstacles(graveGltf.scene, treeGltf.scene, 60); // Increased density
+    this.scatterObstacles([graveGltf.scene, treeGltf.scene, fallTreeGltf.scene, pumpkinGltf], 90); 
 
-    // Real boundary colliders matching the visible walls (was previously dead code:
-    // 'plane' colliders were pushed but never checked in checkCollision)
     this.colliders.push({ type: 'bounds', half: ARENA_HALF });
     
     this.buildInnerMazes();
@@ -109,19 +118,19 @@ export class World {
     buildWall(0, -15, 8, 1);
   }
 
-  scatterObstacles(graveSource, treeSource, count) {
+  scatterObstacles(sources, count) {
     for (let i = 0; i < count; i++) {
-      const isTree = Math.random() > 0.6;
-      const model = SkeletonUtils.clone(isTree ? treeSource : graveSource);
+      const source = sources[Math.floor(Math.random() * sources.length)];
+      const model = SkeletonUtils.clone(source);
 
-      let x = (Math.random() - 0.5) * 40;
-      let z = (Math.random() - 0.5) * 40;
+      let x = (Math.random() - 0.5) * 44;
+      let z = (Math.random() - 0.5) * 44;
 
       if (Math.abs(x) < 5 && Math.abs(z) < 5) continue; // Keep center clear
 
       model.position.set(x, 0, z);
       model.rotation.y = Math.random() * Math.PI * 2;
-      const scaleJitter = 0.85 + Math.random() * 0.3;
+      const scaleJitter = 0.85 + Math.random() * 0.4;
       model.scale.setScalar(scaleJitter);
 
       model.traverse((c) => {
@@ -129,8 +138,8 @@ export class World {
       });
 
       this.scene.add(model);
-      this.mapProps.push({ x, z, isTree });
-      this.colliders.push({ center: new THREE.Vector3(x, 0, z), radius: isTree ? 1.0 * scaleJitter : 0.6 * scaleJitter });
+      this.mapProps.push({ x, z });
+      this.colliders.push({ center: new THREE.Vector3(x, 0, z), radius: 0.25 * scaleJitter });
     }
   }
 
@@ -191,6 +200,135 @@ export class World {
     if (this.fogPoints) {
       this.fogPoints.rotation.y += dt * 0.01;
     }
+    
+    this.powerups.forEach(p => {
+      p.rotation.y += dt * 3.0;
+      p.position.y = Math.abs(Math.sin(this._clock * 4 + p.position.x)) * 1.5;
+    });
+
+    this.traps.forEach(t => {
+      if (t.isEnemy) {
+        t.mesh.rotation.y += dt * 3.0;
+        t.mesh.position.y = Math.abs(Math.sin(this._clock * 4 + t.mesh.position.x)) * 1.5;
+      }
+    });
+
+    if (this.particles) {
+      for (let i = this.particles.length - 1; i >= 0; i--) {
+        const p = this.particles[i];
+        p.life -= dt * 2.0;
+        
+        if (p.mesh) {
+          p.mesh.position.addScaledVector(p.vel, dt);
+          p.vel.y -= dt * 15; // Gravity
+          p.mesh.scale.setScalar(Math.max(0, p.life));
+        }
+        if (p.light) {
+          p.light.intensity = p.life * 5;
+        }
+
+        if (p.life <= 0) {
+          if (p.mesh) this.scene.remove(p.mesh);
+          if (p.light) this.scene.remove(p.light);
+          this.particles.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  spawnPowerup(id, x, z) {
+    if (this.powerups.has(id)) return;
+    const mesh = SkeletonUtils.clone(this.assets.pumpkinModel);
+    mesh.position.set(x, 0, z);
+    
+    // Add glow
+    const light = new THREE.PointLight(0xffa500, 2, 4);
+    light.position.set(0, 0.5, 0);
+    mesh.add(light);
+    
+    // Make material emissive
+    mesh.traverse((c) => {
+      if (c.isMesh) {
+        c.material = c.material.clone();
+        c.material.emissive = new THREE.Color(0xffa500);
+        c.material.emissiveIntensity = 0.6;
+      }
+    });
+
+    this.scene.add(mesh);
+    this.powerups.set(id, mesh);
+  }
+
+  removePowerup(id) {
+    const mesh = this.powerups.get(id);
+    if (mesh) {
+      this.scene.remove(mesh);
+      this.powerups.delete(id);
+    }
+  }
+
+  spawnTrap(id, x, z, role, isEnemy) {
+    if (this.traps.has(id)) return;
+    
+    let mesh;
+    if (isEnemy) {
+      mesh = SkeletonUtils.clone(this.assets.pumpkinModel);
+      const light = new THREE.PointLight(0xffa500, 2, 4);
+      light.position.set(0, 0.5, 0);
+      mesh.add(light);
+      mesh.traverse((c) => {
+        if (c.isMesh) {
+          c.material = c.material.clone();
+          c.material.emissive = new THREE.Color(0xffa500);
+          c.material.emissiveIntensity = 0.6;
+        }
+      });
+      mesh.position.set(x, 0, z);
+    } else {
+      mesh = new THREE.Mesh(this.trapGeo, role === 'zombie' ? this.trapMatZombie : this.trapMatSurvivor);
+      mesh.rotation.x = -Math.PI / 2;
+      mesh.position.set(x, 0.05, z);
+    }
+
+    this.scene.add(mesh);
+    this.traps.set(id, { mesh, role, x, z, isEnemy });
+  }
+
+  removeTrap(id) {
+    const t = this.traps.get(id);
+    if (t) {
+      this.triggerTrapEffect(t.x, t.z, t.role);
+      this.scene.remove(t.mesh);
+      this.traps.delete(id);
+    }
+  }
+
+  triggerTrapEffect(x, z, role) {
+    // Basic explosion effect
+    const color = role === 'zombie' ? 0xa855f7 : 0xf59e0b;
+    const geo = new THREE.IcosahedronGeometry(0.2, 0);
+    const mat = new THREE.MeshBasicMaterial({ color: color });
+    
+    for (let i = 0; i < 15; i++) {
+      const p = new THREE.Mesh(geo, mat);
+      p.position.set(x, 0.5, z);
+      const vel = new THREE.Vector3(
+        (Math.random() - 0.5) * 10,
+        Math.random() * 8,
+        (Math.random() - 0.5) * 10
+      );
+      this.scene.add(p);
+      
+      // We will manage particles in update loop
+      if (!this.particles) this.particles = [];
+      this.particles.push({ mesh: p, vel: vel, life: 1.0 });
+    }
+    
+    // Add a flash light
+    const flash = new THREE.PointLight(color, 5, 8);
+    flash.position.set(x, 1, z);
+    this.scene.add(flash);
+    this.particles.push({ light: flash, life: 1.0 });
   }
 
   checkCollision(pos, radius) {
@@ -225,14 +363,16 @@ export class World {
     this.game = game;
   }
 
-  attemptInfect(zombiePlayer) {
+  attemptInfect(zombiePlayer, radius = 2.0) {
     if (!this.game) return;
-    const infectRadius = 2.0;
 
     this.game.players.forEach((p, id) => {
       if (id !== zombiePlayer.id && p.role === 'survivor' && !p.isDead) {
+        // If survivor has active shield, they cannot be infected
+        if (this.game.activePowerups.shield > 0 && id === this.game.localPlayerId) return;
+
         const dist = zombiePlayer.group.position.distanceTo(p.group.position);
-        if (dist < infectRadius) {
+        if (dist < radius) {
           this.game.network.sendReliable({ type: 'infect_event', targetId: id, sourceId: zombiePlayer.id });
         }
       }

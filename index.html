@@ -14,42 +14,66 @@
 <body>
   <div id="toast-container"></div>
 
+  <div id="portrait-warning" class="portrait-warning">
+    <div class="portrait-warning-content">
+      <h2>Rotate Device</h2>
+      <p>Please rotate your device to landscape mode for the best experience.</p>
+      <span class="rotate-icon">📱</span>
+    </div>
+  </div>
+
   <!-- UI Layer -->
   <div id="ui-layer">
     <!-- Lobby Screen -->
-    <div id="lobby-screen" class="screen active">
-      <div class="lobby-card">
-        <div id="conn-status" class="conn-status conn-connecting">Connecting…</div>
-        <h1 class="game-title">OUTBREAK <span class="accent">ARENA</span></h1>
-        <p class="game-subtitle">One bite changes everything. Survive 3 minutes, or turn the whole lobby.</p>
+    <div id="lobby-screen" class="screen active lobby-new">
+      <div id="conn-status" class="conn-status conn-connecting">Connecting…</div>
+      
+      <div class="lobby-sidebar panel-glass">
+        <h1 class="game-logo">OUTBREAK<br><span class="accent">ARENA</span></h1>
 
-        <div class="menu-actions" id="main-menu">
+        <!-- Profile Section -->
+        <div class="sidebar-section">
+          <label>Player Name</label>
           <input type="text" id="input-name" placeholder="Enter your name" maxlength="12" autocomplete="off" spellcheck="false" />
-          <button id="btn-create-room" class="btn primary">Create Room</button>
-          <div class="divider"><span>OR</span></div>
-          <div class="join-group">
-            <input type="text" id="input-room-code" placeholder="Enter Room Code" maxlength="5" autocomplete="off" spellcheck="false" />
-            <button id="btn-join-room" class="btn secondary">Join Room</button>
+        </div>
+
+        <!-- Main Actions -->
+        <div id="main-menu" class="sidebar-section">
+          <button id="btn-create-room" class="btn-massive primary">▶ CREATE ROOM</button>
+          
+          <div class="join-row">
+            <input type="text" id="input-room-code" placeholder="Code" maxlength="5" autocomplete="off" spellcheck="false" />
+            <button id="btn-join-room" class="btn-massive secondary">JOIN</button>
           </div>
         </div>
 
+        <!-- Room Info (Hidden initially) -->
         <div class="room-waiting hidden" id="room-waiting">
-          <h2 id="room-code-display">Room: -----</h2>
-          <button id="btn-copy-code" class="btn-link">Copy code</button>
+          <div class="room-header">
+            <h2 id="room-code-display">Room: -----</h2>
+            <button id="btn-copy-code" class="btn-link">Copy code</button>
+          </div>
+          
           <div class="players-list">
             <h3>Players (<span id="player-count">1</span>/6)</h3>
             <ul id="players-ul">
               <li>Host (You)</li>
             </ul>
           </div>
+          
           <div id="host-controls">
-            <button id="btn-start-match" class="btn primary disabled" disabled>Start Match (Need 2+)</button>
+            <div class="settings-group">
+              <label for="round-timer-input">Round Time: <span id="round-timer-val">3:00</span></label>
+              <input type="range" id="round-timer-input" min="60" max="300" step="30" value="180">
+            </div>
           </div>
           <div id="peer-status" class="hidden">
             <p>Waiting for host to start…</p>
           </div>
-          <p class="hint">1 zombie is chosen at random. Survivors: reach the glowing crypt to escape. Zombies: infect everyone before the timer runs out.</p>
         </div>
+        
+        <!-- Start Match Button -->
+        <button id="btn-start-match" class="btn-massive primary hidden disabled" disabled>▶ START MATCH</button>
       </div>
     </div>
 
@@ -73,6 +97,8 @@
       </div>
 
       <div id="kill-feed" class="kill-feed"></div>
+      <div id="powerup-announcement" class="powerup-announcement"></div>
+      <div id="powerup-fly" class="powerup-fly hidden">🎃</div>
 
       <div id="chat-panel" class="chat-panel">
         <div id="chat-log" class="chat-log"></div>
@@ -83,6 +109,24 @@
       <div id="joystick-zone"></div>
 
       <div class="action-buttons">
+        <button id="btn-zoom-in" class="btn-circular small-btn hidden" title="Zoom In">+</button>
+        <button id="btn-zoom-out" class="btn-circular small-btn hidden" title="Zoom Out">-</button>
+        
+        <div class="powerups-container">
+          <button class="powerup-slot hidden" id="slot-speed">
+            <span class="p-icon">⚡</span>
+            <span class="p-count" id="count-speed">0</span>
+          </button>
+          <button class="powerup-slot hidden" id="slot-shield">
+            <span class="p-icon">🛡️</span>
+            <span class="p-count" id="count-shield">0</span>
+          </button>
+          <button class="powerup-slot hidden" id="slot-trap">
+            <span class="p-icon">💣</span>
+            <span class="p-count" id="count-trap">0</span>
+          </button>
+        </div>
+
         <button id="btn-action" class="btn-circular hidden">
           <span id="btn-action-label">ACTION</span>
         </button>

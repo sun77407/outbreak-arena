@@ -1,5 +1,6 @@
 import { NetworkManager } from './network.js';
 import { Game } from './game.js';
+import { Menu3D } from './menu3d.js';
 
 // DOM Elements
 const screenLobby = document.getElementById('lobby-screen');
@@ -27,8 +28,10 @@ const btnCopyCode = document.getElementById('btn-copy-code');
 // State
 let network = null;
 let game = null;
+let menu3d = null;
 let isHost = false;
 let starting = false;
+let hostRoundTime = 180;
 
 function showToast(message, kind = 'info') {
   if (!toastContainer) { console.log(message); return; }
@@ -48,6 +51,7 @@ function setLoading(visible, text) {
 
 function init() {
   network = new NetworkManager();
+  menu3d = new Menu3D('game-container');
 
   network.onSignalingStatus = (status) => {
     if (!connStatusEl) return;
@@ -65,6 +69,7 @@ function init() {
     showWaitingRoom(code);
     hostControls.classList.remove('hidden');
     peerStatus.classList.add('hidden');
+    btnStartMatch.classList.remove('hidden');
     updatePlayerList();
   };
 
@@ -73,6 +78,7 @@ function init() {
     showWaitingRoom(code);
     hostControls.classList.add('hidden');
     peerStatus.classList.remove('hidden');
+    btnStartMatch.classList.add('hidden');
     updatePlayerList();
   };
 
@@ -205,11 +211,20 @@ function init() {
   });
 
   btnStartMatch.addEventListener('click', () => {
-    if (isHost && !starting) {
-      starting = true;
-      network.startGame();
-    }
+    if (!isHost || network.reliableChannels.size < 1) return;
+    network.startGame(hostRoundTime);
   });
+
+  const roundTimerInput = document.getElementById('round-timer-input');
+  const roundTimerVal = document.getElementById('round-timer-val');
+  if (roundTimerInput) {
+    roundTimerInput.addEventListener('input', (e) => {
+      hostRoundTime = parseInt(e.target.value);
+      const m = Math.floor(hostRoundTime / 60);
+      const s = hostRoundTime % 60;
+      roundTimerVal.textContent = `${m}:${s.toString().padStart(2, '0')}`;
+    });
+  }
 
   btnBackLobby.addEventListener('click', () => {
     gameOverModal.classList.add('hidden');
@@ -242,6 +257,7 @@ function showMainMenu() {
   screenLobby.classList.remove('hidden');
   screenLobby.classList.add('active');
   screenGame.classList.add('hidden');
+  if (!menu3d) menu3d = new Menu3D('game-container');
 }
 
 function showWaitingRoom(code) {
@@ -281,11 +297,12 @@ function updatePlayerList() {
 }
 
 async function startGame(initialState) {
+  if (menu3d) { menu3d.destroy(); menu3d = null; }
   screenLobby.classList.remove('active');
   screenLobby.classList.add('hidden');
   screenGame.classList.remove('hidden');
 
-  if (!game) game = new Game(network, isHost);
+  game = new Game(network, isHost);
 
   setLoading(true, 'Loading world…');
   try {

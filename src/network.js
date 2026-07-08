@@ -419,7 +419,7 @@ export class NetworkManager {
   }
 
   // Host starts the game
-  startGame() {
+  startGame(roundTime = 180) {
     if (!this.isHost) return;
     const playerIds = [this.myId, ...Array.from(this.reliableChannels.keys())];
     const initialZombieIndex = Math.floor(Math.random() * playerIds.length);
@@ -428,7 +428,8 @@ export class NetworkManager {
     const initialState = {
       players: playerIds,
       zombies: [initialZombieId],
-      startTime: Date.now()
+      startTime: Date.now(),
+      roundTime: roundTime
     };
 
     this.broadcast({ type: 'start_spinner', initialState }, null, true);

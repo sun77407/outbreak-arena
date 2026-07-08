@@ -41,6 +41,21 @@ export class Player {
 
     this.nameTagSprite = null;
 
+    // Visual Effects
+    this.shieldGeo = new THREE.TorusGeometry(1.2, 0.1, 8, 24);
+    this.shieldMatSurvivor = new THREE.MeshBasicMaterial({ color: 0x10b981, transparent: true, opacity: 0.0, depthWrite: false });
+    this.shieldMatZombie = new THREE.MeshBasicMaterial({ color: 0xa855f7, transparent: true, opacity: 0.0, depthWrite: false });
+    this.shieldMesh = new THREE.Mesh(this.shieldGeo, this.shieldMatSurvivor);
+    this.shieldMesh.rotation.x = Math.PI / 2;
+    this.shieldMesh.position.y = 1.0;
+    this.group.add(this.shieldMesh);
+
+    this.trailGeo = new THREE.PlaneGeometry(0.1, 1.0);
+    this.trailMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5, depthWrite: false });
+    this.trails = [];
+    
+    this.activePowerups = { speed: false, shield: false, aura: false };
+
     this.setModel(this.role);
     this.buildNameTag();
   }
@@ -135,10 +150,18 @@ export class Player {
     }, 2000);
   }
 
-  updateLocal(dt, input, world) {
+  updateLocal(dt, input, world, activePowerups = null) {
+    if (activePowerups) {
+      this.activePowerups.speed = activePowerups.speed > 0;
+      this.activePowerups.shield = activePowerups.shield > 0;
+      this.activePowerups.aura = activePowerups.aura > 0;
+    }
+    
+    this.updateVisualEffects(dt);
+
     if (this.isDead || this.isExtracted) {
       this.mixer?.update(dt);
-      return { pos: this.group.position, rot: this.group.rotation.y, anim: this.currentAction, state: this.role, t: Date.now() };
+      return { pos: this.group.position, rot: this.group.rotation.y, anim: this.currentAction, state: this.role, t: Date.now(), powerups: this.activePowerups };
     }
 
     if (this.actionCooldown > 0) this.actionCooldown -= dt;
@@ -202,7 +225,42 @@ export class Player {
       anim: this.currentAction,
       state: this.role,
       t: Date.now(),
+      powerups: this.activePowerups
     };
+  }
+
+  updateVisualEffects(dt) {
+    // Shield/Aura
+    if (this.activePowerups.shield || this.activePowerups.aura) {
+      this.shieldMesh.material = this.role === 'zombie' ? this.shieldMatZombie : this.shieldMatSurvivor;
+      this.shieldMesh.material.opacity = 0.6 + Math.sin(Date.now() * 0.005) * 0.2;
+      this.shieldMesh.rotation.z += dt * 2;
+    } else {
+      this.shieldMesh.material.opacity = 0;
+    }
+
+    // Speed Trail
+    if (this.activePowerups.speed && (Math.abs(this.group.position.x - this.targetPos.x) > 0.1 || this.mixer)) {
+      if (Math.random() < 0.4) {
+        const trail = new THREE.Mesh(this.trailGeo, this.trailMat.clone());
+        trail.position.copy(this.group.position);
+        trail.position.y = 0.1;
+        trail.rotation.x = -Math.PI / 2;
+        trail.rotation.z = this.group.rotation.y + (Math.random() - 0.5) * 0.5;
+        this.scene.add(trail);
+        this.trails.push({ mesh: trail, life: 1.0 });
+      }
+    }
+
+    for (let i = this.trails.length - 1; i >= 0; i--) {
+      const t = this.trails[i];
+      t.life -= dt * 3.0;
+      t.mesh.material.opacity = t.life * 0.5;
+      if (t.life <= 0) {
+        this.scene.remove(t.mesh);
+        this.trails.splice(i, 1);
+      }
+    }
   }
 
   // Push an authoritative snapshot into the interpolation buffer instead of
@@ -217,6 +275,7 @@ export class Player {
       pos: new THREE.Vector3(state.pos.x, state.pos.y, state.pos.z),
       rot: state.rot,
       anim: state.anim,
+      powerups: state.powerups
     });
     // Keep buffer bounded
     if (this.snapshots.length > 20) this.snapshots.shift();
@@ -255,6 +314,17 @@ export class Player {
     }
 
     if (this.mixer) this.mixer.update(dt);
+    
+    if (this.snapshots.length >= 1) {
+       const latest = this.snapshots[this.snapshots.length - 1];
+       if (latest.powerups) {
+         this.activePowerups.speed = latest.powerups.speed;
+         this.activePowerups.shield = latest.powerups.shield;
+         this.activePowerups.aura = latest.powerups.aura;
+       }
+    }
+    
+    this.updateVisualEffects(dt);
   }
 
   destroy() {

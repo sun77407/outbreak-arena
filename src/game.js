@@ -45,6 +45,10 @@ export class Game {
     this.players = new Map();
     this.localPlayerId = this.network.myId;
 
+    this.inventory = { speed: 0, shield: 0, trap: 0 };
+    this.activePowerups = { speed: 0, shield: 0, aura: 0 };
+    this.powerupTimer = 5; // Spawn first powerup after 5s
+
     this.isRunning = false;
     this.isPaused = false;
     this.roundEndTime = 0;
@@ -74,6 +78,10 @@ export class Game {
         this.chatInputEl.blur();
       }
     });
+
+    document.getElementById('slot-speed')?.addEventListener('pointerdown', () => this.usePowerup('speed'));
+    document.getElementById('slot-shield')?.addEventListener('pointerdown', () => this.usePowerup('shield'));
+    document.getElementById('slot-trap')?.addEventListener('pointerdown', () => this.usePowerup('trap'));
   }
 
   async start(initialState, onProgress) {
@@ -96,21 +104,23 @@ export class Game {
     this.updateHUD();
     this.updateActionButtons();
 
-    this.roundEndTime = initialState.startTime + ROUND_MS + 2000;
+    const roundMs = (initialState.roundTime || 180) * 1000;
+    this.roundEndTime = initialState.startTime + roundMs + 2000;
 
     this.isRunning = true;
     this.isPaused = false;
     this.renderer.setAnimationLoop(this.animate.bind(this));
 
     window.addEventListener('wheel', (e) => {
-      if (!this.isRunning) return;
-      const zoomSpeed = 0.05;
-      this.cameraOffset.y += e.deltaY * zoomSpeed;
-      this.cameraOffset.z += e.deltaY * zoomSpeed * 0.8;
-      
-      this.cameraOffset.y = Math.max(8, Math.min(30, this.cameraOffset.y));
-      this.cameraOffset.z = Math.max(6, Math.min(24, this.cameraOffset.z));
+      this.applyZoom(e.deltaY > 0 ? 1 : -1, 0.5);
     });
+
+    const btnZoomIn = document.getElementById('btn-zoom-in');
+    const btnZoomOut = document.getElementById('btn-zoom-out');
+    btnZoomIn?.addEventListener('click', () => this.applyZoom(-1, 2.0));
+    btnZoomOut?.addEventListener('click', () => this.applyZoom(1, 2.0));
+
+    this.setupPinchZoom();
 
     if (this.isHost) {
       this.syncInterval = setInterval(() => this.checkWinConditions(), 1000);
@@ -134,6 +144,36 @@ export class Game {
 
     this.players.set(id, player);
     return player;
+  }
+
+  applyZoom(dir, amount) {
+    if (!this.isRunning) return;
+    this.cameraOffset.y += dir * amount;
+    this.cameraOffset.z += dir * amount * 0.8;
+    this.cameraOffset.y = Math.max(8, Math.min(30, this.cameraOffset.y));
+    this.cameraOffset.z = Math.max(6, Math.min(24, this.cameraOffset.z));
+  }
+
+  setupPinchZoom() {
+    let initialDist = 0;
+    this.container.addEventListener('touchstart', (e) => {
+      if (e.touches.length === 2) {
+        initialDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+      }
+    }, { passive: true });
+    
+    this.container.addEventListener('touchmove', (e) => {
+      if (e.touches.length === 2) {
+        const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
+        if (initialDist > 0) {
+          const delta = initialDist - dist;
+          if (Math.abs(delta) > 5) {
+            this.applyZoom(delta > 0 ? 1 : -1, 0.5);
+            initialDist = dist;
+          }
+        }
+      }
+    }, { passive: true });
   }
 
   stop() {
@@ -200,6 +240,25 @@ export class Game {
         this.pushKillFeed(`${this.nameFor(data.id)} joined late!`);
         this.updateHUD();
       }
+    } else if (data.type === 'spawn_powerup') {
+      this.world.spawnPowerup(data.id, data.x, data.z);
+    } else if (data.type === 'claim_powerup') {
+      this.world.removePowerup(data.id);
+    } else if (data.type === 'use_powerup') {
+      // Show visual effect for other players
+      this.pushKillFeed(`${this.nameFor(senderId)} used ${data.powerup}!`);
+      if (data.powerup === 'trap') {
+        const isEnemy = this.players.get(this.localPlayerId)?.role !== data.role;
+        this.world.spawnTrap(data.trapId, data.x, data.z, data.role, isEnemy);
+      }
+    } else if (data.type === 'trap_trigger') {
+      this.world.removeTrap(data.trapId);
+      const targetPlayer = this.players.get(data.targetId);
+      if (targetPlayer && data.targetId === this.localPlayerId) {
+         this.pushKillFeed(`You hit a trap!`);
+         targetPlayer.actionCooldown = 3.0; // Stun
+         targetPlayer.playAnimation('die', false); // Dazed anim
+      }
     }
   }
 
@@ -261,6 +320,88 @@ export class Game {
     } else {
       btnAction.classList.add('hidden');
     }
+
+    this.updatePowerupUI();
+  }
+
+  updatePowerupUI() {
+    const sSlot = document.getElementById('slot-speed');
+    const shSlot = document.getElementById('slot-shield');
+    const tSlot = document.getElementById('slot-trap');
+    
+    if (sSlot) { sSlot.classList.toggle('hidden', this.inventory.speed === 0); document.getElementById('count-speed').textContent = this.inventory.speed; }
+    if (shSlot) { 
+      shSlot.classList.toggle('hidden', this.inventory.shield === 0); 
+      document.getElementById('count-shield').textContent = this.inventory.shield;
+      const localRole = this.players.get(this.localPlayerId)?.role;
+      shSlot.querySelector('.p-icon').textContent = localRole === 'zombie' ? '🦠' : '🛡️';
+    }
+    if (tSlot) { tSlot.classList.toggle('hidden', this.inventory.trap === 0); document.getElementById('count-trap').textContent = this.inventory.trap; }
+  }
+
+  grantRandomPowerup() {
+    const types = ['speed', 'shield', 'trap'];
+    const selected = types[Math.floor(Math.random() * types.length)];
+    if (this.inventory[selected] < 3) {
+      this.inventory[selected]++;
+      this.updatePowerupUI();
+      this.audio.infectHit(); // Use as pickup sound
+      this.showPowerupAnimation(selected);
+    }
+  }
+
+  showPowerupAnimation(type) {
+    const ann = document.getElementById('powerup-announcement');
+    const fly = document.getElementById('powerup-fly');
+    if (!ann || !fly) return;
+
+    // Show announcement
+    const names = { speed: 'Speed Boost!', shield: 'Shield!', trap: 'Trap!' };
+    ann.textContent = names[type];
+    ann.classList.remove('show');
+    void ann.offsetWidth; // trigger reflow
+    ann.classList.add('show');
+
+    // Show fly animation
+    const slotMap = { speed: 'slot-speed', shield: 'slot-shield', trap: 'slot-trap' };
+    const slotEl = document.getElementById(slotMap[type]);
+    if (slotEl) {
+      const rect = slotEl.getBoundingClientRect();
+      const targetX = rect.left + rect.width / 2;
+      const targetY = rect.top + rect.height / 2;
+      fly.style.setProperty('--target-x', `${targetX}px`);
+      fly.style.setProperty('--target-y', `${targetY}px`);
+      
+      fly.classList.remove('hidden');
+      fly.style.animation = 'none';
+      void fly.offsetWidth; // trigger reflow
+      fly.style.animation = 'flyToSlot 0.8s cubic-bezier(0.5, 0, 0.75, 0) forwards';
+      
+      setTimeout(() => fly.classList.add('hidden'), 800);
+    }
+  }
+
+  usePowerup(type) {
+    if (this.inventory[type] <= 0) return;
+    this.inventory[type]--;
+    this.updatePowerupUI();
+
+    const localPlayer = this.players.get(this.localPlayerId);
+    if (!localPlayer) return;
+
+    let trapId = null;
+
+    if (type === 'speed') {
+       this.activePowerups.speed = 5.0; // 5 seconds
+    } else if (type === 'shield') {
+       if (localPlayer.role === 'zombie') this.activePowerups.aura = 10.0;
+       else this.activePowerups.shield = 8.0;
+    } else if (type === 'trap') {
+       trapId = 'trap_' + Math.random().toString(36).substring(7);
+       this.world.spawnTrap(trapId, localPlayer.group.position.x, localPlayer.group.position.z, localPlayer.role, false);
+    }
+    
+    this.network.sendReliable({ type: 'use_powerup', powerup: type, role: localPlayer.role, x: localPlayer.group.position.x, z: localPlayer.group.position.z, trapId });
   }
 
   updatePingHUD() {
@@ -382,11 +523,52 @@ export class Game {
     const spectating = localPlayer && (localPlayer.isExtracted || (localPlayer.role !== 'zombie' && localPlayer.isDead));
 
     if (localPlayer && !spectating) {
-      const state = localPlayer.updateLocal(dt, this.input, this.world);
+      // Apply active powerups
+      const baseSpeed = localPlayer.role === 'zombie' ? 5.5 : 5.0;
+      localPlayer.speed = this.activePowerups.speed > 0 ? baseSpeed * 1.5 : baseSpeed;
+      
+      const speedPct = this.activePowerups.speed > 0 ? (this.activePowerups.speed / 5.0) * 100 : 0;
+      const shieldMax = localPlayer.role === 'zombie' ? 10.0 : 8.0;
+      const shieldVal = localPlayer.role === 'zombie' ? this.activePowerups.aura : this.activePowerups.shield;
+      const shieldPct = shieldVal > 0 ? (shieldVal / shieldMax) * 100 : 0;
+      
+      document.getElementById('slot-speed')?.style.setProperty('--cooldown-pct', `${100 - speedPct}%`);
+      document.getElementById('slot-shield')?.style.setProperty('--cooldown-pct', `${100 - shieldPct}%`);
+
+      const state = localPlayer.updateLocal(dt, this.input, this.world, this.activePowerups);
 
       if (!this.lastSend || performance.now() - this.lastSend > 33) {
         this.network.sendData({ type: 'state_update', state });
         this.lastSend = performance.now();
+      }
+
+      // Check powerup collection
+      for (const [id, mesh] of this.world.powerups.entries()) {
+        if (localPlayer.group.position.distanceTo(mesh.position) < 1.5) {
+          this.world.removePowerup(id);
+          this.network.sendReliable({ type: 'claim_powerup', id });
+          this.grantRandomPowerup();
+        }
+      }
+
+      // Check trap collision
+      for (const [id, trap] of this.world.traps.entries()) {
+        if (trap.role !== localPlayer.role) {
+          const dist = Math.hypot(localPlayer.group.position.x - trap.x, localPlayer.group.position.z - trap.z);
+          if (dist < 1.0) {
+            this.world.removeTrap(id);
+            this.network.sendReliable({ type: 'trap_trigger', trapId: id, targetId: localPlayer.id });
+            this.handleReliableData(this.localPlayerId, { type: 'trap_trigger', trapId: id, targetId: localPlayer.id });
+          }
+        }
+      }
+
+      // Decrement timers
+      if (this.activePowerups.speed > 0) this.activePowerups.speed -= dt;
+      if (this.activePowerups.shield > 0) this.activePowerups.shield -= dt;
+      if (this.activePowerups.aura > 0) {
+         this.activePowerups.aura -= dt;
+         if (localPlayer.role === 'zombie') this.world.attemptInfect(localPlayer, 4.0);
       }
 
       const targetCamPos = localPlayer.group.position.clone().add(this.cameraOffset);
@@ -418,6 +600,22 @@ export class Game {
 
     const now = Date.now();
     const remain = Math.max(0, this.roundEndTime - now);
+
+    if (this.isHost) {
+      this.powerupTimer -= dt;
+      if (this.powerupTimer <= 0) {
+        const alivePlayers = Array.from(this.players.values()).filter(p => !p.isDead && !p.isExtracted).length;
+        const rate = Math.max(3, 12 - (alivePlayers * 1.5) - (remain < 60000 ? 3 : 0));
+        this.powerupTimer = rate;
+
+        const id = Math.random().toString(36).substring(7);
+        const px = (Math.random() - 0.5) * 44;
+        const pz = (Math.random() - 0.5) * 44;
+        this.network.sendReliable({ type: 'spawn_powerup', id, x: px, z: pz });
+        this.world.spawnPowerup(id, px, pz);
+      }
+    }
+    
     const mins = Math.floor(remain / 60000);
     const secs = Math.floor((remain % 60000) / 1000);
     if (this.timerEl) this.timerEl.textContent = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
