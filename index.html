@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="description" content="Outbreak Arena — a fast, free-to-play browser survivor-vs-zombie multiplayer game. No download, no account, just a room code." />
+  <title>Outbreak Arena</title>
+  <link rel="stylesheet" href="/src/style.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;900&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="toast-container"></div>
+
+  <!-- UI Layer -->
+  <div id="ui-layer">
+    <!-- Lobby Screen -->
+    <div id="lobby-screen" class="screen active">
+      <div class="lobby-card">
+        <div id="conn-status" class="conn-status conn-connecting">Connecting…</div>
+        <h1 class="game-title">OUTBREAK <span class="accent">ARENA</span></h1>
+        <p class="game-subtitle">One bite changes everything. Survive 3 minutes, or turn the whole lobby.</p>
+
+        <div class="menu-actions" id="main-menu">
+          <input type="text" id="input-name" placeholder="Enter your name" maxlength="12" autocomplete="off" spellcheck="false" />
+          <button id="btn-create-room" class="btn primary">Create Room</button>
+          <div class="divider"><span>OR</span></div>
+          <div class="join-group">
+            <input type="text" id="input-room-code" placeholder="Enter Room Code" maxlength="5" autocomplete="off" spellcheck="false" />
+            <button id="btn-join-room" class="btn secondary">Join Room</button>
+          </div>
+        </div>
+
+        <div class="room-waiting hidden" id="room-waiting">
+          <h2 id="room-code-display">Room: -----</h2>
+          <button id="btn-copy-code" class="btn-link">Copy code</button>
+          <div class="players-list">
+            <h3>Players (<span id="player-count">1</span>/6)</h3>
+            <ul id="players-ul">
+              <li>Host (You)</li>
+            </ul>
+          </div>
+          <div id="host-controls">
+            <button id="btn-start-match" class="btn primary disabled" disabled>Start Match (Need 2+)</button>
+          </div>
+          <div id="peer-status" class="hidden">
+            <p>Waiting for host to start…</p>
+          </div>
+          <p class="hint">1 zombie is chosen at random. Survivors: reach the glowing crypt to escape. Zombies: infect everyone before the timer runs out.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- HUD (Game Screen) -->
+    <div id="game-hud" class="screen hidden">
+      <div class="top-hud">
+        <div class="timer" id="round-timer">03:00</div>
+        <div class="stats">
+          <span class="stat survivor">🧍 <span id="count-survivor">0</span></span>
+          <span class="stat zombie">🧟 <span id="count-zombie">0</span></span>
+          <span class="stat ping" id="ping-value">--</span>
+          <button id="btn-mute" class="icon-btn" title="Mute (M)">🔊</button>
+        </div>
+      </div>
+
+      <div id="spectator-banner" class="spectator-banner hidden">👁 Spectating — Space to cycle</div>
+      <div id="damage-vignette"></div>
+
+      <div class="minimap-wrap">
+        <canvas id="minimap-canvas" width="160" height="160"></canvas>
+      </div>
+
+      <div id="kill-feed" class="kill-feed"></div>
+
+      <div id="chat-panel" class="chat-panel">
+        <div id="chat-log" class="chat-log"></div>
+        <input id="chat-input" class="chat-input" type="text" placeholder="Press Enter to chat…" maxlength="140" autocomplete="off" />
+      </div>
+
+      <!-- Virtual Controls -->
+      <div id="joystick-zone"></div>
+
+      <div class="action-buttons">
+        <button id="btn-action" class="btn-circular hidden">
+          <span id="btn-action-label">ACTION</span>
+        </button>
+      </div>
+
+      <div id="spinner-modal" class="modal hidden">
+        <h2 style="font-size: 2rem; color: var(--accent-color);">Selecting Patient Zero...</h2>
+        <div id="spinner-name" class="spinner-name">???</div>
+      </div>
+
+      <div id="game-over-modal" class="modal hidden">
+        <h2 id="game-over-title">GAME OVER</h2>
+        <p id="game-over-desc">Zombies Win!</p>
+        <button id="btn-back-lobby" class="btn primary">Back to Lobby</button>
+      </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay" class="loading-overlay hidden">
+      <div class="loading-spinner"></div>
+      <p id="loading-text">Loading world…</p>
+    </div>
+  </div>
+
+  <!-- Game Canvas Container -->
+  <div id="game-container"></div>
+
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>
