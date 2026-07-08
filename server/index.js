@@ -1,7 +1,10 @@
+'use strict';
+
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const path = require('path');
+const { buildColliders, checkCollision, applyMove, makePRNG, ARENA_HALF } = require('./world-server');
 
 const app = express();
 const server = http.createServer(app);
@@ -9,13 +12,37 @@ const wss = new WebSocketServer({ server });
 
 app.use(express.static(path.join(__dirname, '../dist')));
 app.use('/assets', express.static(path.join(__dirname, '../assets')));
+app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 
-// Simple health check for load balancers / uptime monitors
-app.get('/healthz', (req, res) => res.status(200).send('ok'));
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const MAX_PLAYERS = 6;
+const TICK_MS = 50;            // 20 Hz
+const HISTORY_TICKS = 6;       // ~300 ms of position history for lag comp
+const PLAYER_RADIUS = 0.5;
+const INFECT_RADIUS = 2.2;
+const AURA_INFECT_RADIUS = 4.0;
+const POWERUP_COLLECT_RADIUS = 1.5;
+const TRAP_TRIGGER_RADIUS = 1.0;
 
-// Rooms map: roomCode -> { host: ws, peers: Set(ws) }
-const rooms = new Map();
-const MAX_PEERS_PER_ROOM = 5; // host + 5 peers = 6 max
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+function safeSend(ws, payload) {
+  if (ws && ws.readyState === ws.OPEN) {
+    try { ws.send(JSON.stringify(payload)); } catch (e) { /* ignore */ }
+  }
+}
+
+function broadcast(clients, payload, excludeId = null) {
+  const str = JSON.stringify(payload);
+  for (const ws of clients) {
+    if (ws.playerId !== excludeId && ws.readyState === ws.OPEN) {
+      try { ws.send(str); } catch { /* ignore */ }
+    }
+  }
+}
 
 function generateRoomCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -23,119 +50,556 @@ function generateRoomCode() {
   do {
     code = '';
     for (let i = 0; i < 5; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
-  } while (rooms.has(code)); // avoid rare collisions
+  } while (rooms.has(code));
   return code;
 }
 
-function safeSend(ws, payload) {
-  if (ws && ws.readyState === ws.OPEN) {
-    try { ws.send(JSON.stringify(payload)); } catch (e) { console.error('send failed', e); }
+// ---------------------------------------------------------------------------
+// Room state
+// ---------------------------------------------------------------------------
+/**
+ * Room shape:
+ * {
+ *   code: string,
+ *   clients: Set<WebSocket>,           // all connected WS for this room
+ *   players: Map<id, PlayerState>,
+ *   colliders: array,                  // built from seed on game start
+ *   seed: string,                      // = room code (deterministic layout)
+ *   gameRunning: boolean,
+ *   tick: number,
+ *   roundEndTime: number,              // Date.now() + roundMs
+ *   powerups: Map<id, {x,z}>,
+ *   traps: Map<id, {x,z,role,ownerId}>,
+ *   gameLoopTimer: NodeJS.Timer|null,
+ *   powerupTimer: number,              // seconds until next powerup
+ *   _powerupIdCounter: number,
+ * }
+ *
+ * PlayerState shape:
+ * {
+ *   id: string,
+ *   name: string,
+ *   ws: WebSocket,
+ *   x: number, z: number, rotY: number,
+ *   role: 'survivor'|'zombie',
+ *   isDead: boolean,
+ *   isExtracted: boolean,
+ *   activePowerups: { speed: number, shield: number, aura: number }, // seconds remaining
+ *   speed: number,
+ *   // Input state (latest buffered input from this client)
+ *   inputMove: { x: number, y: number },
+ *   inputAction: boolean,
+ *   inputSeq: number,
+ *   actionCooldown: number,            // seconds
+ *   // Lag compensation: ring buffer of {tick, x, z}
+ *   history: Array<{tick:number, x:number, z:number}>,
+ *   // RTT tracking
+ *   ping: number,                      // ms
+ *   lastPingAt: number,
+ * }
+ */
+const rooms = new Map();
+
+// ---------------------------------------------------------------------------
+// Player helper constructors
+// ---------------------------------------------------------------------------
+function makePlayer(id, name, ws, role = 'survivor') {
+  return {
+    id, name, ws, role,
+    x: 0, z: 0, rotY: 0,
+    isDead: false, isExtracted: false,
+    activePowerups: { speed: 0, shield: 0, aura: 0 },
+    speed: role === 'zombie' ? 5.5 : 5.0,
+    inputMove: { x: 0, y: 0 },
+    inputAction: false, inputSeq: 0,
+    actionCooldown: 0,
+    history: [],
+    ping: 0, lastPingAt: 0,
+  };
+}
+
+function recordHistory(player, tick) {
+  player.history.push({ tick, x: player.x, z: player.z });
+  if (player.history.length > HISTORY_TICKS + 2) player.history.shift();
+}
+
+/** Get rewound position for lag comp (ticks back from current tick). */
+function getHistoricalPos(player, targetTick) {
+  // Clamp to earliest known
+  if (!player.history.length) return { x: player.x, z: player.z };
+  let best = player.history[0];
+  for (const h of player.history) {
+    if (Math.abs(h.tick - targetTick) < Math.abs(best.tick - targetTick)) best = h;
+  }
+  return { x: best.x, z: best.z };
+}
+
+// ---------------------------------------------------------------------------
+// Spawn positions — circle around origin, spread players out
+// ---------------------------------------------------------------------------
+function spawnPositions(count) {
+  const positions = [];
+  for (let i = 0; i < count; i++) {
+    const angle = (i / count) * Math.PI * 2;
+    positions.push({ x: Math.cos(angle) * 3, z: Math.sin(angle) * 3 });
+  }
+  return positions;
+}
+
+// ---------------------------------------------------------------------------
+// Game loop tick
+// ---------------------------------------------------------------------------
+function gameTick(room) {
+  if (!room.gameRunning) return;
+
+  const dt = TICK_MS / 1000;
+  room.tick++;
+
+  // --- 1. Apply inputs → move players ---
+  for (const [, p] of room.players) {
+    if (p.isDead || p.isExtracted) continue;
+    if (p.actionCooldown > 0) p.actionCooldown -= dt;
+
+    const baseSpeed = p.role === 'zombie' ? 5.5 : 5.0;
+    p.speed = p.activePowerups.speed > 0 ? baseSpeed * 1.5 : baseSpeed;
+
+    const { x: mx, y: my } = p.inputMove;
+    if (mx !== 0 || my !== 0) {
+      const len = Math.sqrt(mx * mx + my * my);
+      const nx = mx / len, ny = my / len;
+      const dx = nx * p.speed * dt;
+      const dz = ny * p.speed * dt;
+      const moved = applyMove(p.x, p.z, dx, dz, PLAYER_RADIUS, room.colliders);
+      p.x = moved.x;
+      p.z = moved.z;
+      p.rotY = Math.atan2(nx, ny);
+    }
+
+    // Record history for lag comp
+    recordHistory(p, room.tick);
+
+    // Decrement powerup timers
+    if (p.activePowerups.speed > 0) p.activePowerups.speed -= dt;
+    if (p.activePowerups.shield > 0) p.activePowerups.shield -= dt;
+    if (p.activePowerups.aura > 0) {
+      p.activePowerups.aura -= dt;
+    }
+  }
+
+  // --- 2. Zombie action / aura infect ---
+  for (const [, zombie] of room.players) {
+    if (zombie.role !== 'zombie' || zombie.isDead) continue;
+
+    // Aura infect (constant field while active)
+    if (zombie.activePowerups.aura > 0) {
+      tryInfect(room, zombie, AURA_INFECT_RADIUS, false /* not lag-comp, aura is continuous */);
+    }
+
+    // Button-press infect
+    if (zombie.inputAction && zombie.actionCooldown <= 0) {
+      zombie.actionCooldown = 1.0;
+      // Lag-compensated infect
+      const lagTicks = Math.round((zombie.ping * 0.5) / TICK_MS);
+      const rewindTick = room.tick - lagTicks;
+      tryInfectLagComp(room, zombie, INFECT_RADIUS, rewindTick);
+    }
+  }
+
+  // --- 3. Powerup collection ---
+  for (const [pid, p] of room.players) {
+    if (p.isDead || p.isExtracted) continue;
+    for (const [puid, pu] of room.powerups) {
+      const dx = p.x - pu.x, dz = p.z - pu.z;
+      if (dx * dx + dz * dz < POWERUP_COLLECT_RADIUS * POWERUP_COLLECT_RADIUS) {
+        room.powerups.delete(puid);
+        // Grant a random powerup to the collector
+        const types = ['speed', 'shield', 'trap'];
+        const granted = types[Math.floor(Math.random() * types.length)];
+        broadcast(room.clients, { type: 'powerup_claimed', id: puid, claimerId: pid, granted });
+        break;
+      }
+    }
+  }
+
+  // --- 4. Trap collision ---
+  for (const [, p] of room.players) {
+    if (p.isDead || p.isExtracted) continue;
+    for (const [tid, trap] of room.traps) {
+      if (trap.role === p.role) continue; // only enemy traps
+      const dx = p.x - trap.x, dz = p.z - trap.z;
+      if (dx * dx + dz * dz < TRAP_TRIGGER_RADIUS * TRAP_TRIGGER_RADIUS) {
+        room.traps.delete(tid);
+        broadcast(room.clients, { type: 'trap_trigger', trapId: tid, targetId: p.id });
+      }
+    }
+  }
+
+  // --- 5. Powerup spawn timer ---
+  room.powerupTimer -= dt;
+  if (room.powerupTimer <= 0) {
+    const alivePlayers = [...room.players.values()].filter(p => !p.isDead && !p.isExtracted).length;
+    const remain = Math.max(0, room.roundEndTime - Date.now());
+    const rate = Math.max(3, 12 - alivePlayers * 1.5 - (remain < 60000 ? 3 : 0));
+    room.powerupTimer = rate;
+
+    const rng = makePRNG(room.seed + room.tick);
+    const px = (rng() - 0.5) * 44;
+    const pz = (rng() - 0.5) * 44;
+    const puid = `pu_${room.tick}`;
+    room.powerups.set(puid, { x: px, z: pz });
+    broadcast(room.clients, { type: 'powerup_spawned', id: puid, x: px, z: pz });
+  }
+
+  // --- 6. Build and broadcast snapshot ---
+  const snapshot = {
+    type: 'snapshot',
+    tick: room.tick,
+    players: [],
+  };
+  for (const [, p] of room.players) {
+    snapshot.players.push({
+      id: p.id,
+      x: p.x, z: p.z, rotY: p.rotY,
+      role: p.role,
+      isDead: p.isDead,
+      isExtracted: p.isExtracted,
+      anim: resolveAnim(p),
+      powerups: {
+        speed: p.activePowerups.speed > 0,
+        shield: p.activePowerups.shield > 0,
+        aura: p.activePowerups.aura > 0,
+      },
+    });
+  }
+  broadcast(room.clients, snapshot);
+
+  // --- 7. Check win conditions ---
+  const remain = room.roundEndTime - Date.now();
+  const survivors = [...room.players.values()].filter(p => p.role === 'survivor' && !p.isDead && !p.isExtracted);
+  const zombies = [...room.players.values()].filter(p => p.role === 'zombie');
+
+  if (zombies.length > 0 && survivors.length === 0) {
+    endGame(room, 'zombies');
+  } else if (remain <= 0 && survivors.length > 0) {
+    endGame(room, 'survivors');
   }
 }
 
+function resolveAnim(p) {
+  if (p.isDead) return 'die';
+  const moving = p.inputMove.x !== 0 || p.inputMove.y !== 0;
+  if (p.actionCooldown > 0.7 && p.role === 'zombie') return 'attack-melee-right';
+  return moving ? 'sprint' : 'idle';
+}
+
+// ---------------------------------------------------------------------------
+// Infect helpers
+// ---------------------------------------------------------------------------
+function tryInfect(room, zombie, radius, _lagComp) {
+  for (const [, survivor] of room.players) {
+    if (survivor.role !== 'survivor' || survivor.isDead || survivor.isExtracted) continue;
+    if (survivor.activePowerups.shield > 0) continue;
+    const dx = zombie.x - survivor.x, dz = zombie.z - survivor.z;
+    if (dx * dx + dz * dz < radius * radius) {
+      infectPlayer(room, survivor, zombie.id);
+    }
+  }
+}
+
+function tryInfectLagComp(room, zombie, radius, rewindTick) {
+  for (const [, survivor] of room.players) {
+    if (survivor.role !== 'survivor' || survivor.isDead || survivor.isExtracted) continue;
+    if (survivor.activePowerups.shield > 0) continue;
+    const pos = getHistoricalPos(survivor, rewindTick);
+    const dx = zombie.x - pos.x, dz = zombie.z - pos.z;
+    if (dx * dx + dz * dz < radius * radius) {
+      infectPlayer(room, survivor, zombie.id);
+    }
+  }
+}
+
+function infectPlayer(room, survivor, sourceId) {
+  if (survivor.isDead) return; // avoid double-infect
+  survivor.isDead = true;
+  broadcast(room.clients, { type: 'infect_event', targetId: survivor.id, sourceId });
+
+  // After 2s the player becomes a zombie
+  setTimeout(() => {
+    if (!room.gameRunning) return;
+    const p = room.players.get(survivor.id);
+    if (!p) return;
+    p.role = 'zombie';
+    p.isDead = false;
+    p.speed = 5.5;
+    p.activePowerups = { speed: 0, shield: 0, aura: 0 };
+    broadcast(room.clients, { type: 'role_changed', playerId: p.id, role: 'zombie' });
+  }, 2000);
+}
+
+// ---------------------------------------------------------------------------
+// End game
+// ---------------------------------------------------------------------------
+function endGame(room, result) {
+  if (!room.gameRunning) return;
+  room.gameRunning = false;
+  clearInterval(room.gameLoopTimer);
+  room.gameLoopTimer = null;
+  broadcast(room.clients, { type: 'game_end', result });
+}
+
+// ---------------------------------------------------------------------------
+// Close / cleanup a room
+// ---------------------------------------------------------------------------
 function closeRoom(code, reason) {
   const room = rooms.get(code);
   if (!room) return;
-  room.peers.forEach((p) => {
-    safeSend(p, { type: 'host_disconnected' });
-    try { p.close(); } catch { /* already closed */ }
-  });
+  if (room.gameLoopTimer) clearInterval(room.gameLoopTimer);
+  broadcast(room.clients, { type: 'host_disconnected' });
   rooms.delete(code);
   console.log(`Room ${code} closed (${reason})`);
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket connection handler
+// ---------------------------------------------------------------------------
 wss.on('connection', (ws) => {
-  ws.id = Math.random().toString(36).substr(2, 9);
+  ws.playerId = Math.random().toString(36).substr(2, 9);
+  ws.roomCode = null;
   ws.isAlive = true;
-  let currentRoom = null;
 
   ws.on('pong', () => { ws.isAlive = true; });
 
-  ws.on('message', (message) => {
+  ws.on('message', (raw) => {
     let data;
-    try {
-      data = JSON.parse(message);
-    } catch (e) {
-      safeSend(ws, { type: 'error', message: 'Malformed message.' });
-      return;
-    }
+    try { data = JSON.parse(raw); } catch { return; }
 
     try {
       switch (data.type) {
+
+        // ---- Lobby ----
         case 'create_room': {
-          if (data.myId) ws.id = data.myId;
+          if (data.myId) ws.playerId = data.myId;
           const code = generateRoomCode();
-          currentRoom = code;
-          rooms.set(code, { host: ws, peers: new Set() });
-          safeSend(ws, { type: 'room_created', code });
-          console.log(`Room created: ${code}`);
+          ws.roomCode = code;
+          const room = {
+            code,
+            clients: new Set([ws]),
+            players: new Map([[ws.playerId, makePlayer(ws.playerId, data.myName || 'Player', ws)]]),
+            colliders: [],
+            seed: code,
+            gameRunning: false,
+            tick: 0,
+            roundEndTime: 0,
+            powerups: new Map(),
+            traps: new Map(),
+            gameLoopTimer: null,
+            powerupTimer: 5,
+            _powerupIdCounter: 0,
+          };
+          rooms.set(code, room);
+          safeSend(ws, { type: 'room_created', code, yourId: ws.playerId });
+          console.log(`Room created: ${code} by ${ws.playerId}`);
           break;
         }
 
         case 'join_room': {
-          if (data.myId) ws.id = data.myId;
-          const room = rooms.get(String(data.code || '').toUpperCase());
-          if (!room) {
-            safeSend(ws, { type: 'error', message: 'Room not found.' });
-            return;
-          }
-          if (room.peers.size >= MAX_PEERS_PER_ROOM) {
-            safeSend(ws, { type: 'error', message: 'Room is full.' });
-            return;
-          }
-          currentRoom = String(data.code).toUpperCase();
-          room.peers.add(ws);
+          if (data.myId) ws.playerId = data.myId;
+          const code = String(data.code || '').toUpperCase();
+          const room = rooms.get(code);
+          if (!room) { safeSend(ws, { type: 'error', message: 'Room not found.' }); return; }
+          if (room.players.size >= MAX_PLAYERS) { safeSend(ws, { type: 'error', message: 'Room is full.' }); return; }
 
-          safeSend(room.host, { type: 'peer_joined', peerId: ws.id });
-          safeSend(ws, { type: 'room_joined', code: currentRoom, hostId: room.host.id });
-          console.log(`Peer ${ws.id} joined room: ${currentRoom}`);
+          ws.roomCode = code;
+          room.clients.add(ws);
+
+          const newPlayer = makePlayer(ws.playerId, data.myName || 'Player', ws);
+          room.players.set(ws.playerId, newPlayer);
+
+          // Tell the newcomer who's already here
+          const existingPlayers = [...room.players.entries()]
+            .filter(([id]) => id !== ws.playerId)
+            .map(([id, p]) => ({ id, name: p.name }));
+
+          safeSend(ws, { type: 'room_joined', code, yourId: ws.playerId, players: existingPlayers });
+
+          // If game is already running, send them current state
+          if (room.gameRunning) {
+            const syncState = buildInitialState(room);
+            safeSend(ws, { type: 'game_start', initialState: syncState });
+          }
+
+          // Tell everyone else a new player joined
+          broadcast(room.clients, { type: 'peer_joined', id: ws.playerId, name: newPlayer.name }, ws.playerId);
+          console.log(`Player ${ws.playerId} joined room ${code}`);
           break;
         }
 
-        case 'signal': {
-          const targetRoom = rooms.get(currentRoom);
-          if (!targetRoom) return;
+        case 'start_game': {
+          const room = rooms.get(ws.roomCode);
+          if (!room || room.gameRunning) return;
+          if (room.players.size < 2) { safeSend(ws, { type: 'error', message: 'Need at least 2 players.' }); return; }
 
-          if (ws === targetRoom.host) {
-            const targetPeer = Array.from(targetRoom.peers).find((p) => p.id === data.targetId);
-            if (targetPeer) {
-              safeSend(targetPeer, { type: 'signal', senderId: ws.id, signalData: data.signalData });
-            }
-          } else {
-            safeSend(targetRoom.host, { type: 'signal', senderId: ws.id, signalData: data.signalData });
+          startGame(room, data.roundTime || 180, data.useSpinner !== false);
+          break;
+        }
+
+        // ---- Gameplay ----
+        case 'input': {
+          const room = rooms.get(ws.roomCode);
+          if (!room || !room.gameRunning) return;
+          const p = room.players.get(ws.playerId);
+          if (!p || p.isDead || p.isExtracted) return;
+          if (data.move) {
+            p.inputMove.x = Math.max(-1, Math.min(1, data.move.x || 0));
+            p.inputMove.y = Math.max(-1, Math.min(1, data.move.y || 0));
+          }
+          p.inputAction = !!data.action;
+          p.inputSeq = data.seq || 0;
+          break;
+        }
+
+        case 'use_powerup': {
+          const room = rooms.get(ws.roomCode);
+          if (!room || !room.gameRunning) return;
+          const p = room.players.get(ws.playerId);
+          if (!p) return;
+          handlePowerupUse(room, p, data.powerup, data.trapId, data.x, data.z);
+          break;
+        }
+
+        case 'chat': {
+          const room = rooms.get(ws.roomCode);
+          if (!room) return;
+          const p = room.players.get(ws.playerId);
+          const safeText = String(data.text || '').slice(0, 140);
+          broadcast(room.clients, { type: 'chat', senderId: ws.playerId, senderName: p?.name || 'Unknown', text: safeText, t: Date.now() });
+          break;
+        }
+
+        case 'pong': {
+          const room = rooms.get(ws.roomCode);
+          if (!room) return;
+          const p = room.players.get(ws.playerId);
+          if (p && data.t) {
+            p.ping = Math.round(Date.now() - data.t);
           }
           break;
         }
 
-        default:
-          // Unknown message types are ignored rather than crashing the connection
-          break;
+        default: break;
       }
     } catch (e) {
-      console.error('Error handling message', e);
-      safeSend(ws, { type: 'error', message: 'Server error processing your request.' });
+      console.error('Error handling message:', e);
     }
   });
 
   ws.on('close', () => {
-    if (!currentRoom) return;
-    const room = rooms.get(currentRoom);
+    const room = rooms.get(ws.roomCode);
     if (!room) return;
+    room.players.delete(ws.playerId);
+    room.clients.delete(ws);
+    broadcast(room.clients, { type: 'peer_left', id: ws.playerId });
+    console.log(`Player ${ws.playerId} left room ${ws.roomCode}`);
 
-    if (ws === room.host) {
-      closeRoom(currentRoom, 'host disconnect');
-    } else {
-      room.peers.delete(ws);
-      safeSend(room.host, { type: 'peer_disconnected', peerId: ws.id });
-      console.log(`Peer ${ws.id} left room ${currentRoom}`);
+    if (room.players.size === 0) {
+      closeRoom(ws.roomCode, 'all players left');
     }
   });
 
   ws.on('error', (e) => console.error('WS error', e));
 });
 
-// Drop dead sockets (e.g. laptop lid closed, phone backgrounded) so rooms
-// don't stay stuck waiting on a connection that will never come back.
+// ---------------------------------------------------------------------------
+// Start game
+// ---------------------------------------------------------------------------
+function buildInitialState(room) {
+  return {
+    seed: room.seed,
+    roundTime: Math.max(0, Math.round((room.roundEndTime - Date.now()) / 1000)),
+    startTime: room.roundEndTime - (room._roundMs || 180000),
+    players: [...room.players.keys()],
+    zombies: [...room.players.values()].filter(p => p.role === 'zombie').map(p => p.id),
+    positions: [...room.players.values()].map(p => ({ id: p.id, x: p.x, z: p.z })),
+    playerNames: [...room.players.values()].map(p => ({ id: p.id, name: p.name })),
+  };
+}
+
+function startGame(room, roundTime, useSpinner) {
+  const playerIds = [...room.players.keys()];
+  const zombieIdx = Math.floor(Math.random() * playerIds.length);
+  const zombieId = playerIds[zombieIdx];
+
+  // Build collision geometry using room code as seed
+  room.colliders = buildColliders(room.seed);
+
+  // Assign roles and spawn positions
+  const positions = spawnPositions(playerIds.length);
+  playerIds.forEach((id, i) => {
+    const p = room.players.get(id);
+    p.role = id === zombieId ? 'zombie' : 'survivor';
+    p.x = positions[i].x;
+    p.z = positions[i].z;
+    p.isDead = false;
+    p.isExtracted = false;
+    p.activePowerups = { speed: 0, shield: 0, aura: 0 };
+    p.actionCooldown = 0;
+    p.history = [];
+    p.inputMove = { x: 0, y: 0 };
+    p.inputAction = false;
+  });
+
+  room.gameRunning = true;
+  room.tick = 0;
+  room._roundMs = roundTime * 1000;
+  room.roundEndTime = Date.now() + room._roundMs + 2000;
+  room.powerups.clear();
+  room.traps.clear();
+  room.powerupTimer = 5;
+
+  const initialState = buildInitialState(room);
+  const msgType = useSpinner ? 'start_spinner' : 'game_start';
+  broadcast(room.clients, { type: msgType, initialState });
+
+  // Start ping loop (every 2s)
+  const pingInterval = setInterval(() => {
+    if (!room.gameRunning && room.players.size === 0) { clearInterval(pingInterval); return; }
+    broadcast(room.clients, { type: 'ping', t: Date.now() });
+  }, 2000);
+
+  // Start game loop
+  room.gameLoopTimer = setInterval(() => gameTick(room), TICK_MS);
+  console.log(`Game started in room ${room.code}, zombie: ${zombieId}, seed: ${room.seed}`);
+}
+
+// ---------------------------------------------------------------------------
+// Powerup use handler
+// ---------------------------------------------------------------------------
+function handlePowerupUse(room, player, powerupType, trapId, trapX, trapZ) {
+  if (powerupType === 'speed') {
+    player.activePowerups.speed = 5.0;
+  } else if (powerupType === 'shield') {
+    if (player.role === 'zombie') player.activePowerups.aura = 10.0;
+    else player.activePowerups.shield = 8.0;
+  } else if (powerupType === 'trap' && trapId) {
+    const x = trapX || player.x;
+    const z = trapZ || player.z;
+    room.traps.set(trapId, { x, z, role: player.role, ownerId: player.id });
+  }
+
+  broadcast(room.clients, {
+    type: 'use_powerup',
+    senderId: player.id,
+    powerup: powerupType,
+    role: player.role,
+    trapId: trapId || null,
+    x: trapX || player.x,
+    z: trapZ || player.z,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat to detect dead sockets
+// ---------------------------------------------------------------------------
 const heartbeat = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
@@ -147,12 +611,9 @@ const heartbeat = setInterval(() => {
 wss.on('close', () => clearInterval(heartbeat));
 
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully');
   clearInterval(heartbeat);
   server.close(() => process.exit(0));
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Signaling server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`OutbreakArena server running on port ${PORT}`));

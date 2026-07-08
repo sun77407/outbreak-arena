@@ -29,9 +29,12 @@ const btnCopyCode = document.getElementById('btn-copy-code');
 let network = null;
 let game = null;
 let menu3d = null;
-let isHost = false;
 let starting = false;
 let hostRoundTime = 180;
+
+// Button debounce state
+let _createBusy = false;
+let _joinBusy = false;
 
 function showToast(message, kind = 'info') {
   if (!toastContainer) { console.log(message); return; }
@@ -65,7 +68,7 @@ function init() {
   };
 
   network.onRoomCreated = (code) => {
-    isHost = true;
+    _createBusy = false;
     showWaitingRoom(code);
     hostControls.classList.remove('hidden');
     peerStatus.classList.add('hidden');
@@ -74,7 +77,7 @@ function init() {
   };
 
   network.onRoomJoined = (code) => {
-    isHost = false;
+    _joinBusy = false;
     showWaitingRoom(code);
     hostControls.classList.add('hidden');
     peerStatus.classList.remove('hidden');
@@ -85,35 +88,37 @@ function init() {
   network.onPeerJoined = (peerId) => {
     updatePlayerList();
     showToast('A survivor joined the lobby.');
-    if (isHost && network.reliableChannels.size >= 1) {
+    // Count players — in the new model anyone who's in the room can start,
+    // but we keep the original UX: host sees the button after ≥1 other player joins.
+    const totalPlayers = network.playerNames.size;
+    if (network.isHost && totalPlayers >= 2) {
       btnStartMatch.classList.remove('disabled');
       btnStartMatch.disabled = false;
       btnStartMatch.textContent = 'Start Match';
     }
 
-    if (isHost && game && game.isRunning) {
-      const syncState = {
-        players: Array.from(game.players.keys()),
-        zombies: Array.from(game.players.values()).filter(p => p.role === 'zombie').map(p => p.id),
-        startTime: game.startTime
-      };
-      network.sendToPeer(peerId, { type: 'game_start', initialState: syncState });
-
-      if (!game.players.has(peerId)) {
-        game.spawnPlayer(peerId, 'survivor');
-        network.broadcast({ type: 'player_spawn', id: peerId, role: 'survivor' }, peerId, true);
-      }
+    // If game is already running, server handles sending the late-join game_start.
+    // We just need to locally spawn the player if they appear via peer_joined mid-game.
+    if (game && game.isRunning && !game.players.has(peerId)) {
+      const name = network.playerNames.get(peerId) || `Player ${peerId.slice(0, 4)}`;
+      game.spawnPlayer(peerId, 'survivor', null, [{ id: peerId, name }]);
+      game.updateHUD();
     }
   };
 
-  network.onLobbySync = () => {
-    updatePlayerList();
-  };
+  network.onLobbySync = () => { updatePlayerList(); };
 
-  network.onPeerLeft = () => {
+  network.onPeerLeft = (peerId) => {
     updatePlayerList();
     showToast('A player disconnected.', 'warn');
-    if (isHost && network.reliableChannels.size < 1) {
+
+    // Remove them from the active game immediately so they don't stay as a ghost
+    if (game && game.isRunning) {
+      game.removePlayer(peerId);
+    }
+
+    const totalPlayers = network.playerNames.size;
+    if (network.isHost && totalPlayers < 2) {
       btnStartMatch.classList.add('disabled');
       btnStartMatch.disabled = true;
       btnStartMatch.textContent = 'Start Match (Need 2+)';
@@ -121,12 +126,14 @@ function init() {
   };
 
   network.onError = (msg) => {
+    _createBusy = false;
+    _joinBusy = false;
     showToast(msg, 'error');
     if (!game) showMainMenu();
   };
 
   network.onHostDisconnected = () => {
-    showToast('Host disconnected.', 'error');
+    showToast('Connection to server lost.', 'error');
     if (game) { game.stop(); game = null; }
     showMainMenu();
   };
@@ -142,16 +149,16 @@ function init() {
   function showSpinner(initialState) {
     const spinnerModal = document.getElementById('spinner-modal');
     const spinnerName = document.getElementById('spinner-name');
-    
+
     screenLobby.classList.remove('active');
     screenLobby.classList.add('hidden');
-    screenGame.classList.remove('hidden'); // UNHIDE GAME SCREEN SO IT DOESN'T LOOK PITCH BLACK!
+    screenGame.classList.remove('hidden');
     spinnerModal.classList.remove('hidden');
     spinnerName.classList.remove('highlight');
-    
+
     const players = initialState.players;
     const zombieId = initialState.zombies[0];
-    
+
     let cycles = 0;
     const interval = setInterval(() => {
       cycles++;
@@ -159,14 +166,14 @@ function init() {
       let dName = network.playerNames.get(randId) || `Player ${randId.slice(0, 4)}`;
       if (randId === network.myId) dName = 'You';
       spinnerName.textContent = dName;
-      
+
       if (cycles >= 30) {
         clearInterval(interval);
         let zName = network.playerNames.get(zombieId) || `Player ${zombieId.slice(0, 4)}`;
         if (zombieId === network.myId) zName = 'You';
         spinnerName.textContent = zName;
         spinnerName.classList.add('highlight');
-        
+
         setTimeout(() => {
           spinnerModal.classList.add('hidden');
           startGame(initialState);
@@ -184,34 +191,38 @@ function init() {
     }
   };
 
-  // UI Listeners
+  // UI listeners
   btnCreateRoom.addEventListener('click', () => {
-    isHost = true;
+    if (_createBusy) return; // debounce
+    _createBusy = true;
     network.myName = document.getElementById('input-name').value.trim() || 'Survivor';
     network.playerNames.set(network.myId, network.myName);
     setLoading(true, 'Creating room…');
     network.createRoom();
+    // Safety unlock after 3s in case the server never responds
+    setTimeout(() => { _createBusy = false; }, 3000);
   });
 
   btnJoinRoom.addEventListener('click', () => {
+    if (_joinBusy) return; // debounce
     const code = inputRoomCode.value.trim().toUpperCase();
     if (!code) return showToast('Please enter a room code');
-    isHost = false;
+    _joinBusy = true;
     network.myName = document.getElementById('input-name').value.trim() || 'Survivor';
     network.playerNames.set(network.myId, network.myName);
     setLoading(true, 'Joining room…');
     network.joinRoom(code);
+    setTimeout(() => { _joinBusy = false; }, 3000);
   });
 
-  inputRoomCode.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') btnJoinRoom.click();
-  });
+  inputRoomCode.addEventListener('keydown', (e) => { if (e.key === 'Enter') btnJoinRoom.click(); });
   inputRoomCode.addEventListener('input', () => {
     inputRoomCode.value = inputRoomCode.value.toUpperCase().slice(0, 5);
   });
 
   btnStartMatch.addEventListener('click', () => {
-    if (!isHost || network.reliableChannels.size < 1) return;
+    if (!network.isHost) return;
+    if (network.playerNames.size < 2) return;
     network.startGame(hostRoundTime);
   });
 
@@ -233,9 +244,7 @@ function init() {
     showWaitingRoom(network.roomCode);
   });
 
-  btnMute?.addEventListener('click', () => {
-    if (game) game.toggleMute();
-  });
+  btnMute?.addEventListener('click', () => { if (game) game.toggleMute(); });
 
   btnCopyCode?.addEventListener('click', async () => {
     if (!network.roomCode) return;
@@ -270,39 +279,26 @@ function showWaitingRoom(code) {
 }
 
 function updatePlayerList() {
+  if (!playersUl) return;
   playersUl.innerHTML = '';
-
-  const addLi = (id, name, isHostLi) => {
+  network.playerNames.forEach((name, id) => {
     const li = document.createElement('li');
-    if (id === network.myId) name += ' (You)';
-    li.textContent = name;
+    li.textContent = id === network.myId ? `${name} (You)` : name;
     playersUl.appendChild(li);
-  };
-
-  const hostName = network.playerNames.get(isHost ? network.myId : network.hostId) || 'Host';
-  addLi(isHost ? network.myId : network.hostId, hostName, true);
-
-  if (isHost) {
-    network.reliableChannels.forEach((_, id) => {
-      const name = network.playerNames.get(id) || `Peer ${id.slice(0, 4)}`;
-      addLi(id, name, false);
-    });
-    playerCountEl.textContent = network.reliableChannels.size + 1;
-  } else {
-    network.playerNames.forEach((name, id) => {
-      if (id !== network.hostId) addLi(id, name, false);
-    });
-    playerCountEl.textContent = network.playerNames.size || 1;
-  }
+  });
+  if (playerCountEl) playerCountEl.textContent = network.playerNames.size;
 }
 
 async function startGame(initialState) {
+  if (starting) return;
+  starting = true;
   if (menu3d) { menu3d.destroy(); menu3d = null; }
   screenLobby.classList.remove('active');
   screenLobby.classList.add('hidden');
   screenGame.classList.remove('hidden');
 
-  game = new Game(network, isHost);
+  // Game constructor no longer needs isHost flag — server handles all host logic
+  game = new Game(network);
 
   setLoading(true, 'Loading world…');
   try {
@@ -312,6 +308,7 @@ async function startGame(initialState) {
     showToast('Failed to load the arena. Check your connection and try again.', 'error');
     setLoading(false);
     showMainMenu();
+    starting = false;
     return;
   }
   setLoading(false);

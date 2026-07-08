@@ -4,10 +4,33 @@ import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 
 const ARENA_HALF = 25;
 
+// ---------------------------------------------------------------------------
+// Seeded PRNG — mulberry32.
+// Must match the implementation in server/world-server.js exactly.
+// ---------------------------------------------------------------------------
+function hashSeed(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h;
+}
+
+function makePRNG(seed) {
+  let s = typeof seed === 'string' ? hashSeed(seed) : seed >>> 0;
+  return function () {
+    s |= 0; s = s + 0x6d2b79f5 | 0;
+    let t = Math.imul(s ^ s >>> 15, 1 | s);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
 export class World {
   constructor(scene) {
     this.scene = scene;
-    this.colliders = []; // { center: Vector3, radius: number }
+    this.colliders = []; // { type:'sphere', center:Vector3, radius } or { type:'box', cx,cz,hw,hd }
     this.safeZone = { center: new THREE.Vector3(0, 0, -15), radius: 3 };
     this.loader = new GLTFLoader();
     this.assets = {
@@ -17,25 +40,27 @@ export class World {
       cloneModel: (source) => SkeletonUtils.clone(source),
     };
 
-    this.mapProps = [];
+    this.mapProps = [];   // { x, z, isWall?, w?, d? } for minimap
     this.safeZoneRing = null;
     this._clock = 0;
-    
-    this.powerups = new Map();
-    // No longer using octahedron for powerups, will use glowing pumpkin
 
+    this.powerups = new Map();
     this.traps = new Map();
     this.trapGeo = new THREE.PlaneGeometry(1.5, 1.5);
     this.trapMatSurvivor = new THREE.MeshBasicMaterial({ color: 0x10b981, transparent: true, opacity: 0.4, depthWrite: false });
     this.trapMatZombie = new THREE.MeshBasicMaterial({ color: 0xef4444, transparent: true, opacity: 0.4, depthWrite: false });
   }
 
-  async init(onProgress) {
+  /**
+   * @param {function} onProgress  - loading progress callback
+   * @param {string}   seed        - room code used to seed obstacle PRNG
+   */
+  async init(onProgress, seed = 'DEFAULT') {
     onProgress?.('Loading survivors & the infected...');
     await this.loadCharacters();
 
     onProgress?.('Building the arena...');
-    await this.buildArena();
+    await this.buildArena(seed);
 
     onProgress?.('Lighting the scene...');
     const ambientLight = new THREE.AmbientLight(0x4a3a6a, 2.2);
@@ -80,22 +105,23 @@ export class World {
     this.assets.animations = survivorGltf.animations;
   }
 
-  async buildArena() {
+  async buildArena(seed) {
     const graveGltf = await this.loader.loadAsync('/assets/Models/GLB format/gravestone-cross.glb');
     const treeGltf = await this.loader.loadAsync('/assets/Models/GLB format/pine.glb');
     const fallTreeGltf = await this.loader.loadAsync('/assets/Models/GLB format/pine-fall.glb');
     const pumpkinGltf = this.assets.pumpkinModel;
 
-    this.scatterObstacles([graveGltf.scene, treeGltf.scene, fallTreeGltf.scene, pumpkinGltf], 90); 
+    // Pass the seed so every client with the same room code gets the same layout
+    this.scatterObstacles([graveGltf.scene, treeGltf.scene, fallTreeGltf.scene, pumpkinGltf], 90, seed);
 
     this.colliders.push({ type: 'bounds', half: ARENA_HALF });
-    
+
     this.buildInnerMazes();
   }
 
   buildInnerMazes() {
     const wallMat = new THREE.MeshStandardMaterial({ color: 0x223344, roughness: 0.8, metalness: 0.2 });
-    
+
     const buildWall = (cx, cz, w, d) => {
       const geo = new THREE.BoxGeometry(w, 4, d);
       const mesh = new THREE.Mesh(geo, wallMat);
@@ -103,34 +129,44 @@ export class World {
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       this.scene.add(mesh);
-      
-      this.colliders.push({ type: 'box', cx, cz, hw: w/2, hd: d/2 });
-      // Map props for minimap (draw walls as rectangles if possible, but let's just push them as props for now)
+      this.colliders.push({ type: 'box', cx, cz, hw: w / 2, hd: d / 2 });
       this.mapProps.push({ x: cx, z: cz, isWall: true, w, d });
     };
 
-    // Build some simple maze structures
-    buildWall(10, 10, 12, 1);
-    buildWall(-10, 10, 12, 1);
-    buildWall(10, -10, 1, 12);
-    buildWall(-10, -10, 1, 12);
-    buildWall(0, 15, 8, 1);
-    buildWall(0, -15, 8, 1);
+    // Must match MAZE_WALLS in server/world-server.js exactly
+    buildWall(10,   10,  12, 1);
+    buildWall(-10,  10,  12, 1);
+    buildWall(10,  -10,   1, 12);
+    buildWall(-10, -10,   1, 12);
+    buildWall(0,    15,   8, 1);
+    buildWall(0,   -15,   8, 1);
   }
 
-  scatterObstacles(sources, count) {
+  /**
+   * Scatter obstacles using a seeded PRNG so every client with the same
+   * seed produces the same layout. Algorithm and RNG calls must match
+   * buildColliders() in server/world-server.js.
+   */
+  scatterObstacles(sources, count, seed) {
+    const rng = makePRNG(seed);
+
     for (let i = 0; i < count; i++) {
-      const source = sources[Math.floor(Math.random() * sources.length)];
+      const srcIdx = Math.floor(rng() * sources.length);
+      const source = sources[srcIdx];
       const model = SkeletonUtils.clone(source);
 
-      let x = (Math.random() - 0.5) * 44;
-      let z = (Math.random() - 0.5) * 44;
+      const x = (rng() - 0.5) * 44;
+      const z = (rng() - 0.5) * 44;
+      const rotY = rng() * Math.PI * 2;
+      const scaleJitter = 0.85 + rng() * 0.4;
 
-      if (Math.abs(x) < 5 && Math.abs(z) < 5) continue; // Keep center clear
+      if (Math.abs(x) < 5 && Math.abs(z) < 5) continue;
+
+      // Skip if it would overlap a maze wall (simple AABB vs point check)
+      if (this._overlapsWall(x, z)) continue;
 
       model.position.set(x, 0, z);
-      model.rotation.y = Math.random() * Math.PI * 2;
-      const scaleJitter = 0.85 + Math.random() * 0.4;
+      model.rotation.y = rotY;
       model.scale.setScalar(scaleJitter);
 
       model.traverse((c) => {
@@ -139,13 +175,31 @@ export class World {
 
       this.scene.add(model);
       this.mapProps.push({ x, z });
-      this.colliders.push({ center: new THREE.Vector3(x, 0, z), radius: 0.25 * scaleJitter });
+
+      // Larger radius (0.5) so visual model and physics match — was 0.25 before
+      this.colliders.push({
+        type: 'sphere',
+        center: new THREE.Vector3(x, 0, z),
+        radius: 0.5 * scaleJitter,
+      });
     }
   }
 
+  /** Quick check: would placing an obstacle at (x,z) block a maze wall passage? */
+  _overlapsWall(x, z) {
+    const WALL_SAFE = 1.5;
+    const walls = [
+      { cx: 10, cz: 10, hw: 6, hd: 0.5 }, { cx: -10, cz: 10, hw: 6, hd: 0.5 },
+      { cx: 10, cz: -10, hw: 0.5, hd: 6 }, { cx: -10, cz: -10, hw: 0.5, hd: 6 },
+      { cx: 0, cz: 15, hw: 4, hd: 0.5 }, { cx: 0, cz: -15, hw: 4, hd: 0.5 },
+    ];
+    for (const w of walls) {
+      if (Math.abs(x - w.cx) < w.hw + WALL_SAFE && Math.abs(z - w.cz) < w.hd + WALL_SAFE) return true;
+    }
+    return false;
+  }
+
   buildBoundaryWalls() {
-    // Low chain-link-style fence so the arena edge is visible, not an invisible wall
-    // players bump into with no feedback.
     const fenceMat = new THREE.MeshStandardMaterial({ color: 0x334455, roughness: 0.6, metalness: 0.4, transparent: true, opacity: 0.85 });
     const fenceHeight = 2.2;
     const postGeo = new THREE.CylinderGeometry(0.08, 0.08, fenceHeight, 6);
@@ -169,19 +223,17 @@ export class World {
       this.scene.add(rail);
     };
 
-    buildSide('x', 1);
-    buildSide('x', -1);
-    buildSide('z', 1);
-    buildSide('z', -1);
+    buildSide('x', 1); buildSide('x', -1);
+    buildSide('z', 1); buildSide('z', -1);
   }
 
   buildAmbientFog() {
-    // Cheap ground-hugging particle haze for atmosphere
     const count = 120;
     const geo = new THREE.BufferGeometry();
     const positions = new Float32Array(count * 3);
+    // Use simple deterministic layout for fog (aesthetic only, doesn't need seed)
     for (let i = 0; i < count; i++) {
-      positions[i * 3] = (Math.random() - 0.5) * 48;
+      positions[i * 3]     = (Math.random() - 0.5) * 48;
       positions[i * 3 + 1] = Math.random() * 1.2;
       positions[i * 3 + 2] = (Math.random() - 0.5) * 48;
     }
@@ -200,7 +252,7 @@ export class World {
     if (this.fogPoints) {
       this.fogPoints.rotation.y += dt * 0.01;
     }
-    
+
     this.powerups.forEach(p => {
       p.rotation.y += dt * 3.0;
       p.position.y = Math.abs(Math.sin(this._clock * 4 + p.position.x)) * 1.5;
@@ -217,16 +269,12 @@ export class World {
       for (let i = this.particles.length - 1; i >= 0; i--) {
         const p = this.particles[i];
         p.life -= dt * 2.0;
-        
         if (p.mesh) {
           p.mesh.position.addScaledVector(p.vel, dt);
-          p.vel.y -= dt * 15; // Gravity
+          p.vel.y -= dt * 15;
           p.mesh.scale.setScalar(Math.max(0, p.life));
         }
-        if (p.light) {
-          p.light.intensity = p.life * 5;
-        }
-
+        if (p.light) p.light.intensity = p.life * 5;
         if (p.life <= 0) {
           if (p.mesh) this.scene.remove(p.mesh);
           if (p.light) this.scene.remove(p.light);
@@ -240,13 +288,9 @@ export class World {
     if (this.powerups.has(id)) return;
     const mesh = SkeletonUtils.clone(this.assets.pumpkinModel);
     mesh.position.set(x, 0, z);
-    
-    // Add glow
     const light = new THREE.PointLight(0xffa500, 2, 4);
     light.position.set(0, 0.5, 0);
     mesh.add(light);
-    
-    // Make material emissive
     mesh.traverse((c) => {
       if (c.isMesh) {
         c.material = c.material.clone();
@@ -254,22 +298,17 @@ export class World {
         c.material.emissiveIntensity = 0.6;
       }
     });
-
     this.scene.add(mesh);
     this.powerups.set(id, mesh);
   }
 
   removePowerup(id) {
     const mesh = this.powerups.get(id);
-    if (mesh) {
-      this.scene.remove(mesh);
-      this.powerups.delete(id);
-    }
+    if (mesh) { this.scene.remove(mesh); this.powerups.delete(id); }
   }
 
   spawnTrap(id, x, z, role, isEnemy) {
     if (this.traps.has(id)) return;
-    
     let mesh;
     if (isEnemy) {
       mesh = SkeletonUtils.clone(this.assets.pumpkinModel);
@@ -289,7 +328,6 @@ export class World {
       mesh.rotation.x = -Math.PI / 2;
       mesh.position.set(x, 0.05, z);
     }
-
     this.scene.add(mesh);
     this.traps.set(id, { mesh, role, x, z, isEnemy });
   }
@@ -304,27 +342,17 @@ export class World {
   }
 
   triggerTrapEffect(x, z, role) {
-    // Basic explosion effect
     const color = role === 'zombie' ? 0xa855f7 : 0xf59e0b;
     const geo = new THREE.IcosahedronGeometry(0.2, 0);
-    const mat = new THREE.MeshBasicMaterial({ color: color });
-    
+    const mat = new THREE.MeshBasicMaterial({ color });
     for (let i = 0; i < 15; i++) {
       const p = new THREE.Mesh(geo, mat);
       p.position.set(x, 0.5, z);
-      const vel = new THREE.Vector3(
-        (Math.random() - 0.5) * 10,
-        Math.random() * 8,
-        (Math.random() - 0.5) * 10
-      );
+      const vel = new THREE.Vector3((Math.random() - 0.5) * 10, Math.random() * 8, (Math.random() - 0.5) * 10);
       this.scene.add(p);
-      
-      // We will manage particles in update loop
       if (!this.particles) this.particles = [];
-      this.particles.push({ mesh: p, vel: vel, life: 1.0 });
+      this.particles.push({ mesh: p, vel, life: 1.0 });
     }
-    
-    // Add a flash light
     const flash = new THREE.PointLight(color, 5, 8);
     flash.position.set(x, 1, z);
     this.scene.add(flash);
@@ -332,10 +360,15 @@ export class World {
   }
 
   checkCollision(pos, radius) {
-    if (pos.x < -(ARENA_HALF - 1) || pos.x > (ARENA_HALF - 1) || pos.z < -(ARENA_HALF - 1) || pos.z > (ARENA_HALF - 1)) return true;
+    if (pos.x < -(ARENA_HALF - 1) || pos.x > (ARENA_HALF - 1) ||
+        pos.z < -(ARENA_HALF - 1) || pos.z > (ARENA_HALF - 1)) return true;
 
     for (const c of this.colliders) {
-      if (c.radius) { // sphere collider
+      if (c.type === 'sphere' && c.center) {
+        const dist = pos.distanceTo(c.center);
+        if (dist < radius + c.radius) return true;
+      } else if (c.radius && c.center) {
+        // legacy sphere format
         const dist = pos.distanceTo(c.center);
         if (dist < radius + c.radius) return true;
       } else if (c.type === 'box') {
@@ -351,31 +384,7 @@ export class World {
     return pos.distanceTo(this.safeZone.center) < this.safeZone.radius;
   }
 
-  // Data used to draw the 2D minimap without touching three.js internals every frame
   getMinimapData() {
-    return {
-      half: ARENA_HALF,
-      props: this.mapProps,
-    };
-  }
-
-  setGameRef(game) {
-    this.game = game;
-  }
-
-  attemptInfect(zombiePlayer, radius = 2.0) {
-    if (!this.game) return;
-
-    this.game.players.forEach((p, id) => {
-      if (id !== zombiePlayer.id && p.role === 'survivor' && !p.isDead) {
-        // If survivor has active shield, they cannot be infected
-        if (this.game.activePowerups.shield > 0 && id === this.game.localPlayerId) return;
-
-        const dist = zombiePlayer.group.position.distanceTo(p.group.position);
-        if (dist < radius) {
-          this.game.network.sendReliable({ type: 'infect_event', targetId: id, sourceId: zombiePlayer.id });
-        }
-      }
-    });
+    return { half: ARENA_HALF, props: this.mapProps };
   }
 }

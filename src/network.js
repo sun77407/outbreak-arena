@@ -1,3 +1,12 @@
+/**
+ * network.js — Pure WebSocket client.
+ * WebRTC removed. The server is now the authoritative simulation;
+ * this module only handles the WS connection and message routing.
+ *
+ * Public API intentionally kept compatible with the old version
+ * (same callback names) so main.js changes are minimal.
+ */
+
 export class NetworkManager {
   constructor() {
     this.ws = null;
@@ -6,44 +15,41 @@ export class NetworkManager {
     this.myName = 'Survivor';
     this.playerNames = new Map();
     this.playerNames.set(this.myId, this.myName);
+
+    // These exist only for API compatibility with main.js checks
+    this.isHost = false;   // no longer meaningful — all players are equal peers
     this.hostId = null;
-    this.isHost = false;
+
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 6;
     this._manualClose = false;
+    this._inputSeq = 0;
 
-    // peers Map: peerId -> RTCPeerConnection
-    this.peers = new Map();
-    // Two channels per peer for a good latency/reliability tradeoff:
-    //  - "fast": unreliable, unordered — position/rotation/anim ticks, dropped packets are fine
-    //  - "reliable": ordered, retried — infect/extract/game_start/game_end/chat, must arrive
-    this.fastChannels = new Map();
-    this.reliableChannels = new Map();
-    // Buffer ICE candidates that arrive before remote description is set
-    this.pendingCandidates = new Map();
+    this.ping = 0;          // ms RTT to server
 
-    this.ping = new Map(); // peerId -> ms RTT (for peers), or hostId->ms if I'm a peer
-    this._pingTimers = new Map();
-
+    // Callbacks
     this.onRoomCreated = null;
     this.onRoomJoined = null;
     this.onPeerJoined = null;
     this.onPeerLeft = null;
     this.onLobbySync = null;
     this.onError = null;
-    this.onHostDisconnected = null;
+    this.onHostDisconnected = null;   // kept for compat — fires when server forcibly closes room
     this.onGameStarted = null;
     this.onGameEnded = null;
-    this.onPeerData = null;       // fast-channel gameplay data
-    this.onReliableData = null;   // reliable-channel events (infect/extract/etc, forwarded by game.js)
+    this.onSnapshot = null;           // replaces onPeerData — called with each server snapshot
+    this.onServerEvent = null;        // reliable game events: infect, powerup_spawned, etc.
     this.onChatMessage = null;
-    this.onSignalingStatus = null; // ('connecting'|'connected'|'reconnecting'|'failed')
-    this.onPingUpdate = null;      // (peerId, ms)
+    this.onSignalingStatus = null;
+    this.onPingUpdate = null;
 
-    this.connectSignaling();
+    this.connectServer();
   }
 
-  connectSignaling() {
+  // ---------------------------------------------------------------------------
+  // Connection management
+  // ---------------------------------------------------------------------------
+  connectServer() {
     let wsHost = window.location.host;
     if (window.location.hostname === 'localhost' && window.location.port !== '3000') {
       wsHost = 'localhost:3000';
@@ -56,383 +62,194 @@ export class NetworkManager {
     this.ws.onopen = () => {
       this.reconnectAttempts = 0;
       if (this.onSignalingStatus) this.onSignalingStatus('connected');
-      console.log('Connected to signaling server');
+      console.log('Connected to game server');
     };
 
     this.ws.onmessage = (event) => {
       let data;
       try { data = JSON.parse(event.data); } catch { return; }
-      this.handleSignalingMessage(data);
+      this._handleMessage(data);
     };
 
     this.ws.onclose = () => {
-      console.log('Disconnected from signaling server');
+      console.log('Disconnected from game server');
       if (this._manualClose) return;
-      // Only treat as fatal if we haven't already established a live game session via WebRTC.
-      if (this.peers.size === 0) {
-        this._tryReconnectSignaling();
-      }
+      this._tryReconnect();
     };
 
-    this.ws.onerror = () => { /* onclose will fire right after */ };
+    this.ws.onerror = () => { /* onclose fires after */ };
   }
 
-  _tryReconnectSignaling() {
+  _tryReconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       if (this.onSignalingStatus) this.onSignalingStatus('failed');
-      if (this.onError) this.onError('Lost connection to the signaling server.');
+      if (this.onError) this.onError('Lost connection to the server.');
       return;
     }
     this.reconnectAttempts++;
     const delay = Math.min(4000, 300 * Math.pow(2, this.reconnectAttempts));
     if (this.onSignalingStatus) this.onSignalingStatus('reconnecting');
-    setTimeout(() => this.connectSignaling(), delay);
+    setTimeout(() => this.connectServer(), delay);
   }
 
-  handleSignalingMessage(data) {
+  // ---------------------------------------------------------------------------
+  // Message routing
+  // ---------------------------------------------------------------------------
+  _handleMessage(data) {
     switch (data.type) {
+
       case 'room_created':
         this.roomCode = data.code;
-        this.isHost = true;
-        this.hostId = this.myId;
+        this.myId = data.yourId || this.myId;
+        this.isHost = true;   // first player in room — can start the game
+        this.playerNames.set(this.myId, this.myName);
         if (this.onRoomCreated) this.onRoomCreated(this.roomCode);
         break;
 
       case 'room_joined':
         this.roomCode = data.code;
-        this.hostId = data.hostId;
+        this.myId = data.yourId || this.myId;
+        this.isHost = false;
+        // Populate names from existing players
+        (data.players || []).forEach(p => this.playerNames.set(p.id, p.name));
+        this.playerNames.set(this.myId, this.myName);
         if (this.onRoomJoined) this.onRoomJoined(this.roomCode);
-        this.initiatePeerConnection(this.hostId);
+        if (this.onLobbySync) this.onLobbySync();
         break;
 
       case 'peer_joined':
-        console.log('Peer joined:', data.peerId);
+        this.playerNames.set(data.id, data.name || `Player ${data.id.slice(0, 4)}`);
+        if (this.onPeerJoined) this.onPeerJoined(data.id);
+        if (this.onLobbySync) this.onLobbySync();
         break;
 
-      case 'peer_disconnected':
-        this.removePeer(data.peerId);
-        if (this.onPeerLeft) this.onPeerLeft(data.peerId);
+      case 'peer_left':
+        this.playerNames.delete(data.id);
+        if (this.onPeerLeft) this.onPeerLeft(data.id);
+        if (this.onLobbySync) this.onLobbySync();
         break;
 
       case 'host_disconnected':
-        this.cleanup();
         if (this.onHostDisconnected) this.onHostDisconnected();
         break;
 
-      case 'signal':
-        this.handleWebRTCSignal(data.senderId, data.signalData);
+      case 'game_start':
+        if (this.onGameStarted) this.onGameStarted(data.initialState, false);
+        break;
+
+      case 'start_spinner':
+        if (this.onGameStarted) this.onGameStarted(data.initialState, true);
+        break;
+
+      case 'snapshot':
+        if (this.onSnapshot) this.onSnapshot(data);
+        break;
+
+      // Reliable game events — route through onServerEvent
+      case 'infect_event':
+      case 'role_changed':
+      case 'powerup_spawned':
+      case 'powerup_claimed':
+      case 'use_powerup':
+      case 'trap_trigger':
+      case 'player_spawn':
+        if (this.onServerEvent) this.onServerEvent(data);
+        break;
+
+      case 'game_end':
+        if (this.onGameEnded) this.onGameEnded(data.result);
+        break;
+
+      case 'chat':
+        if (this.onChatMessage) this.onChatMessage(data.senderId, data);
+        break;
+
+      case 'ping':
+        // Server pings us; we pong back immediately for RTT tracking
+        this._send({ type: 'pong', t: data.t });
+        // Also use the round-trip to compute our ping estimate
+        if (data.t) {
+          this.ping = Math.round(Date.now() - data.t);
+          if (this.onPingUpdate) this.onPingUpdate(null, this.ping);
+        }
         break;
 
       case 'error':
         if (this.onError) this.onError(data.message);
         break;
+
+      default: break;
     }
   }
 
-  createRoom() { this.ws.send(JSON.stringify({ type: 'create_room', myId: this.myId })); }
-  joinRoom(code) { this.ws.send(JSON.stringify({ type: 'join_room', code, myId: this.myId })); }
-
-  // ---- WebRTC Host-Relay Logic ----
-
-  createPeerConnection(targetId) {
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:stun1.l.google.com:19302' },
-        // Add a TURN server here for reliable connectivity behind restrictive NATs, e.g.:
-        // { urls: 'turn:your-turn-host:3478', username: '...', credential: '...' }
-      ],
-      iceCandidatePoolSize: 4,
-    });
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        this.ws.send(JSON.stringify({
-          type: 'signal',
-          targetId,
-          signalData: { type: 'ice', candidate: event.candidate }
-        }));
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      console.log(`Connection state with ${targetId}:`, pc.connectionState);
-      if (pc.connectionState === 'failed') {
-        // One ICE restart attempt before giving up on this peer
-        pc.restartIce?.();
-      }
-      if (pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
-        this.removePeer(targetId);
-        if (this.onPeerLeft) this.onPeerLeft(targetId);
-      }
-    };
-
-    this.peers.set(targetId, pc);
-    return pc;
-  }
-
-  async initiatePeerConnection(hostId) {
-    const pc = this.createPeerConnection(hostId);
-
-    const fast = pc.createDataChannel('fast', { ordered: false, maxRetransmits: 0 });
-    const reliable = pc.createDataChannel('reliable', { ordered: true });
-    this.setupDataChannel(fast, hostId, false);
-    this.setupDataChannel(reliable, hostId, true);
-
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    this.ws.send(JSON.stringify({
-      type: 'signal',
-      targetId: hostId,
-      signalData: { type: 'offer', sdp: offer }
-    }));
-  }
-
-  async handleWebRTCSignal(senderId, signalData) {
-    let pc = this.peers.get(senderId);
-
-    if (signalData.type === 'offer') {
-      if (!pc) {
-        pc = this.createPeerConnection(senderId);
-        pc.ondatachannel = (event) => {
-          const isReliable = event.channel.label === 'reliable';
-          this.setupDataChannel(event.channel, senderId, isReliable);
-        };
-      }
-      await pc.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
-      await this._flushPendingCandidates(senderId, pc);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-
-      this.ws.send(JSON.stringify({
-        type: 'signal',
-        targetId: senderId,
-        signalData: { type: 'answer', sdp: answer }
-      }));
-    } else if (signalData.type === 'answer') {
-      if (pc) {
-        await pc.setRemoteDescription(new RTCSessionDescription(signalData.sdp));
-        await this._flushPendingCandidates(senderId, pc);
-      }
-    } else if (signalData.type === 'ice') {
-      if (pc && pc.remoteDescription) {
-        try { await pc.addIceCandidate(new RTCIceCandidate(signalData.candidate)); }
-        catch (e) { console.warn('ICE candidate error', e); }
-      } else {
-        // Remote description not set yet — buffer it
-        if (!this.pendingCandidates.has(senderId)) this.pendingCandidates.set(senderId, []);
-        this.pendingCandidates.get(senderId).push(signalData.candidate);
-      }
+  // ---------------------------------------------------------------------------
+  // Internal send helper
+  // ---------------------------------------------------------------------------
+  _send(data) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try { this.ws.send(JSON.stringify(data)); } catch { /* ignore */ }
     }
   }
 
-  async _flushPendingCandidates(peerId, pc) {
-    const list = this.pendingCandidates.get(peerId);
-    if (!list) return;
-    for (const c of list) {
-      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) { console.warn(e); }
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+  createRoom() {
+    this._send({ type: 'create_room', myId: this.myId, myName: this.myName });
+  }
+
+  joinRoom(code) {
+    this._send({ type: 'join_room', code, myId: this.myId, myName: this.myName });
+  }
+
+  /**
+   * Send player input to server (replaces sendData / position broadcast).
+   * Called every frame (throttled by game.js to ~30Hz).
+   */
+  sendInput(move, action) {
+    this._inputSeq++;
+    this._send({ type: 'input', seq: this._inputSeq, move, action: !!action });
+    return this._inputSeq;
+  }
+
+  /**
+   * Send reliable event to server (powerup use, etc.).
+   * Kept for API compatibility; all traffic now goes over the same WS.
+   */
+  sendReliable(data) {
+    this._send(data);
+  }
+
+  sendChat(text) {
+    const safeText = String(text).slice(0, 140);
+    this._send({ type: 'chat', text: safeText });
+    // Echo locally
+    if (this.onChatMessage) {
+      this.onChatMessage(this.myId, { senderId: this.myId, senderName: this.myName, text: safeText, t: Date.now() });
     }
-    this.pendingCandidates.delete(peerId);
   }
 
-  setupDataChannel(dc, targetId, isReliable) {
-    const store = isReliable ? this.reliableChannels : this.fastChannels;
-
-    dc.onopen = () => {
-      store.set(targetId, dc);
-      console.log(`${isReliable ? 'Reliable' : 'Fast'} channel open with ${targetId}`);
-
-      // Exchange names immediately
-      if (isReliable) {
-        dc.send(JSON.stringify({ type: 'hello', name: this.myName }));
-      }
-
-      // Only announce "peer joined" once both channels for that peer are open
-      if (this.fastChannels.has(targetId) && this.reliableChannels.has(targetId)) {
-        if (this.isHost && this.onPeerJoined) this.onPeerJoined(targetId);
-        if (this.isHost) this._syncLobby();
-        this._startPing(targetId);
-      }
-    };
-
-    dc.onclose = () => { store.delete(targetId); };
-
-    dc.onmessage = (event) => {
-      let msg;
-      try { msg = JSON.parse(event.data); } catch { return; }
-
-      if (msg.type === 'ping') {
-        this._sendRaw(targetId, isReliable, { type: 'pong', t: msg.t });
-        return;
-      }
-      if (msg.type === 'pong') {
-        const rtt = performance.now() - msg.t;
-        this.ping.set(targetId, Math.round(rtt));
-        if (this.onPingUpdate) this.onPingUpdate(targetId, Math.round(rtt));
-        return;
-      }
-      if (msg.type === 'game_start') {
-        if (this.onGameStarted) this.onGameStarted(msg.initialState, false);
-        return;
-      }
-      if (msg.type === 'start_spinner') {
-        if (this.onGameStarted) this.onGameStarted(msg.initialState, true);
-        return;
-      }
-      if (msg.type === 'lobby_sync') {
-        this.playerNames.clear();
-        this.playerNames.set(this.myId, this.myName);
-        msg.players.forEach(p => {
-          this.playerNames.set(p.id, p.name);
-        });
-        if (this.onLobbySync) this.onLobbySync();
-        return;
-      }
-      if (msg.type === 'hello') {
-        this.playerNames.set(targetId, msg.name);
-        if (this.isHost) this._syncLobby();
-        return;
-      }
-      if (msg.type === 'game_end') {
-        if (this.onGameEnded) this.onGameEnded(msg.result);
-        return;
-      }
-      if (msg.type === 'chat') {
-        if (this.onChatMessage) this.onChatMessage(targetId, msg);
-        if (this.isHost) this.broadcast(msg, targetId, true);
-        return;
-      }
-
-      if (isReliable) {
-        if (this.onReliableData) this.onReliableData(targetId, msg);
-        if (this.isHost) this.broadcast(msg, targetId, true);
-      } else {
-        if (this.onPeerData) this.onPeerData(targetId, msg);
-        if (this.isHost && msg.type === 'state_update') {
-          msg.peerId = targetId;
-          this.broadcast(msg, targetId, false);
-        }
-      }
-    };
+  startGame(roundTime = 180) {
+    // Any player in the lobby can start (server will forward to all).
+    // The first player (isHost flag) is the only one who sees the button.
+    this._send({ type: 'start_game', roundTime, useSpinner: true });
   }
 
-  _startPing(peerId) {
-    if (this._pingTimers.has(peerId)) clearInterval(this._pingTimers.get(peerId));
-    const timer = setInterval(() => {
-      this._sendRaw(peerId, true, { type: 'ping', t: performance.now() });
-    }, 2000);
-    this._pingTimers.set(peerId, timer);
-    this._sendRaw(peerId, true, { type: 'ping', t: performance.now() });
-  }
-
-  _sendRaw(peerId, reliable, data) {
-    const dc = (reliable ? this.reliableChannels : this.fastChannels).get(peerId);
-    if (dc && dc.readyState === 'open') dc.send(JSON.stringify(data));
-  }
-
-  _syncLobby() {
-    if (!this.isHost) return;
-    const players = Array.from(this.playerNames.entries()).filter(([id]) => 
-      id === this.myId || this.reliableChannels.has(id)
-    ).map(([id, name]) => ({ id, name }));
-    
-    this.broadcast({ type: 'lobby_sync', players }, null, true);
-  }
-
-  removePeer(peerId) {
-    const fdc = this.fastChannels.get(peerId); if (fdc) fdc.close();
-    const rdc = this.reliableChannels.get(peerId); if (rdc) rdc.close();
-    this.fastChannels.delete(peerId);
-    this.reliableChannels.delete(peerId);
-
-    const pc = this.peers.get(peerId);
-    if (pc) pc.close();
-    this.peers.delete(peerId);
-
-    if (this._pingTimers.has(peerId)) { clearInterval(this._pingTimers.get(peerId)); this._pingTimers.delete(peerId); }
-    this.ping.delete(peerId);
-    if (this.isHost) this._syncLobby();
-  }
-
-  cleanup() {
-    for (const [id] of this.peers) this.removePeer(id);
+  getMyPing() {
+    return this.ping || null;
   }
 
   close() {
     this._manualClose = true;
-    this.cleanup();
     if (this.ws) this.ws.close();
   }
 
-  // Fast (unreliable) send — position/rotation/anim ticks
-  sendData(data) {
-    if (this.isHost) {
-      this.broadcast(data, null, false);
-    } else {
-      this._sendRaw(this.hostId, false, data);
-    }
-  }
-
-  // Reliable send — must-arrive events (infect, extract, chat, etc.)
-  sendReliable(data) {
-    if (this.isHost) {
-      this.broadcast(data, null, true);
-    } else {
-      this._sendRaw(this.hostId, true, data);
-    }
-  }
-
-  // Send to a specific peer (useful for late-join sync)
-  sendToPeer(peerId, data, reliable = true) {
-    this._sendRaw(peerId, reliable, data);
-  }
-
-  sendChat(text) {
-    const msg = { type: 'chat', senderId: this.myId, text: String(text).slice(0, 140), t: Date.now() };
-    if (this.isHost) {
-      this.broadcast(msg, null, true);
-      if (this.onChatMessage) this.onChatMessage(this.myId, msg);
-    } else {
-      this._sendRaw(this.hostId, true, msg);
-      if (this.onChatMessage) this.onChatMessage(this.myId, msg);
-    }
-  }
-
-  // Host only: send to all peers (optionally exclude one)
-  broadcast(data, excludeId = null, reliable = false) {
-    if (!this.isHost) return;
-    const store = reliable ? this.reliableChannels : this.fastChannels;
-    const msgStr = JSON.stringify(data);
-    for (const [id, dc] of store) {
-      if (id !== excludeId && dc.readyState === 'open') dc.send(msgStr);
-    }
-  }
-
-  getMyPing() {
-    // As a peer, my relevant ping is to the host
-    if (!this.isHost) return this.ping.get(this.hostId) ?? null;
-    // As host, report the worst peer ping (bottleneck for the match)
-    let worst = null;
-    for (const v of this.ping.values()) { if (worst === null || v > worst) worst = v; }
-    return worst;
-  }
-
-  // Host starts the game
-  startGame(roundTime = 180) {
-    if (!this.isHost) return;
-    const playerIds = [this.myId, ...Array.from(this.reliableChannels.keys())];
-    const initialZombieIndex = Math.floor(Math.random() * playerIds.length);
-    const initialZombieId = playerIds[initialZombieIndex];
-
-    const initialState = {
-      players: playerIds,
-      zombies: [initialZombieId],
-      startTime: Date.now(),
-      roundTime: roundTime
-    };
-
-    this.broadcast({ type: 'start_spinner', initialState }, null, true);
-    if (this.onGameStarted) this.onGameStarted(initialState, true);
-  }
+  // ---------------------------------------------------------------------------
+  // Kept for API compatibility — no-ops in the new architecture
+  // ---------------------------------------------------------------------------
+  sendData() { /* inputs now sent via sendInput */ }
+  broadcast() { /* server handles broadcasting */ }
+  sendToPeer() { /* no peers, server handles distribution */ }
+  removePeer() { /* no peers */ }
+  cleanup() { /* no peer connections to clean up */ }
 }

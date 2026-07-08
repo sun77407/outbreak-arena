@@ -86,6 +86,7 @@
           <span class="stat zombie">🧟 <span id="count-zombie">0</span></span>
           <span class="stat ping" id="ping-value">--</span>
           <button id="btn-mute" class="icon-btn" title="Mute (M)">🔊</button>
+          <button id="btn-pause" class="icon-btn" title="Pause (Esc)">⏸</button>
         </div>
       </div>
 
@@ -93,7 +94,7 @@
       <div id="damage-vignette"></div>
 
       <div class="minimap-wrap">
-        <canvas id="minimap-canvas" width="160" height="160"></canvas>
+        <canvas id="minimap-canvas" width="200" height="200"></canvas>
       </div>
 
       <div id="kill-feed" class="kill-feed"></div>
@@ -109,8 +110,8 @@
       <div id="joystick-zone"></div>
 
       <div class="action-buttons">
-        <button id="btn-zoom-in" class="btn-circular small-btn hidden" title="Zoom In">+</button>
-        <button id="btn-zoom-out" class="btn-circular small-btn hidden" title="Zoom Out">-</button>
+        <button id="btn-zoom-in" class="btn-circular small-btn" title="Zoom In">+</button>
+        <button id="btn-zoom-out" class="btn-circular small-btn" title="Zoom Out">-</button>
         
         <div class="powerups-container">
           <button class="powerup-slot hidden" id="slot-speed">

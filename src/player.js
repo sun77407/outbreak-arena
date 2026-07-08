@@ -1,10 +1,9 @@
 import * as THREE from 'three';
 
-// Remote players are rendered slightly in the past and interpolated between
-// real snapshots instead of always chasing the newest one. This trades a
-// small fixed delay (~100ms) for eliminating the jitter/rubber-banding you'd
-// otherwise see under normal internet jitter or packet loss.
-const INTERP_DELAY_MS = 100;
+// Remote players are rendered INTERP_DELAY_TICKS behind the latest
+// server tick to smooth over packet-arrival jitter.
+// At 20Hz (50ms/tick) this is 100ms — same as before but now tick-based.
+const INTERP_DELAY_TICKS = 2;
 
 export class Player {
   constructor(id, role, scene, assets, displayName = null) {
@@ -24,8 +23,11 @@ export class Player {
 
     this.speed = this.role === 'zombie' ? 5.5 : 5.0;
 
-    // Snapshot buffer for remote interpolation: [{ t, pos, rot, anim }]
+    // Snapshot buffer for remote interpolation: [{ tick, pos, rot, anim, powerups }]
+    // Sorted by tick ascending. New snapshots are insert-sorted; stale ones dropped.
     this.snapshots = [];
+    this._lastAppliedTick = -1;
+
     this.targetPos = new THREE.Vector3();
     this.targetRot = 0;
 
@@ -34,8 +36,6 @@ export class Player {
     this.actionCooldown = 0;
     this._footstepTimer = 0;
 
-    // Optional hooks wired up by Game for audio/particles — kept decoupled
-    // so Player has no direct dependency on the audio engine.
     this.onFootstep = null;
     this.onAttack = null;
 
@@ -53,7 +53,7 @@ export class Player {
     this.trailGeo = new THREE.PlaneGeometry(0.1, 1.0);
     this.trailMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5, depthWrite: false });
     this.trails = [];
-    
+
     this.activePowerups = { speed: false, shield: false, aura: false };
 
     this.setModel(this.role);
@@ -92,57 +92,44 @@ export class Player {
 
   setModel(role) {
     if (this.model) this.group.remove(this.model);
-
     this.role = role;
     this.speed = this.role === 'zombie' ? 5.5 : 5.0;
     const sourceModel = role === 'survivor' ? this.assets.survivorModel : this.assets.zombieModel;
-
     this.model = this.assets.cloneModel(sourceModel);
-
     this.model.traverse((child) => {
       if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; }
     });
-
     this.group.add(this.model);
-
     this.mixer = new THREE.AnimationMixer(this.model);
     this.actions = {};
     this.assets.animations.forEach((clip) => {
       this.actions[clip.name] = this.mixer.clipAction(clip);
     });
-
     this.playAnimation('idle');
     this.updateNameTagColor();
   }
 
   playAnimation(name, loop = true) {
     if (this.currentAction === name) return;
-
     let action = this.actions[name];
     if (!action) {
-      // Graceful fallback if an animation clip name is missing from the model
-      // instead of silently doing nothing (previous behavior).
       action = this.actions['idle'];
       name = 'idle';
       if (!action) return;
     }
-
     const prev = this.actions[this.currentAction];
     if (prev) prev.fadeOut(0.2);
-
     action.reset();
     action.setLoop(loop ? THREE.LoopRepeat : THREE.LoopOnce);
     action.clampWhenFinished = !loop;
     action.fadeIn(0.2);
     action.play();
-
     this.currentAction = name;
   }
 
   infect() {
     this.isDead = true;
     this.playAnimation('die', false);
-
     setTimeout(() => {
       this.setModel('zombie');
       this.isDead = false;
@@ -150,29 +137,30 @@ export class Player {
     }, 2000);
   }
 
+  // ---- Local player update (client-side prediction) ----
+  // Returns { move, action } for sending to server as input message.
   updateLocal(dt, input, world, activePowerups = null) {
     if (activePowerups) {
       this.activePowerups.speed = activePowerups.speed > 0;
       this.activePowerups.shield = activePowerups.shield > 0;
       this.activePowerups.aura = activePowerups.aura > 0;
     }
-    
+
     this.updateVisualEffects(dt);
 
     if (this.isDead || this.isExtracted) {
       this.mixer?.update(dt);
-      return { pos: this.group.position, rot: this.group.rotation.y, anim: this.currentAction, state: this.role, t: Date.now(), powerups: this.activePowerups };
+      return { move: { x: 0, y: 0 }, action: false };
     }
 
     if (this.actionCooldown > 0) this.actionCooldown -= dt;
 
     let animToPlay = 'idle';
-
     const move = input.getMovement();
+
     if (move.x !== 0 || move.y !== 0) {
       const moveVec = new THREE.Vector3(move.x, 0, move.y).normalize();
       const targetAngle = Math.atan2(moveVec.x, moveVec.z);
-
       let diff = targetAngle - this.group.rotation.y;
       while (diff < -Math.PI) diff += Math.PI * 2;
       while (diff > Math.PI) diff -= Math.PI * 2;
@@ -184,7 +172,6 @@ export class Player {
       if (!world.checkCollision(newPos, 0.5)) {
         this.group.position.copy(newPos);
       } else {
-        // Slide along whichever axis is still clear
         const posX = this.group.position.clone(); posX.x += step.x;
         const posZ = this.group.position.clone(); posZ.z += step.z;
         if (!world.checkCollision(posX, 0.5)) this.group.position.copy(posX);
@@ -192,8 +179,6 @@ export class Player {
       }
 
       animToPlay = 'sprint';
-
-      // Footstep cadence tied to speed, not framerate
       this._footstepTimer -= dt;
       if (this._footstepTimer <= 0) {
         this.onFootstep?.(this);
@@ -203,13 +188,12 @@ export class Player {
       this._footstepTimer = 0;
     }
 
-    if (input.isActionPressed() && this.actionCooldown <= 0) {
-      if (this.role === 'zombie') {
-        animToPlay = 'attack-melee-right';
-        this.actionCooldown = 1.0;
-        this.onAttack?.(this);
-        world.attemptInfect(this);
-      }
+    const action = input.isActionPressed();
+    if (action && this.actionCooldown <= 0 && this.role === 'zombie') {
+      animToPlay = 'attack-melee-right';
+      this.actionCooldown = 1.0;
+      this.onAttack?.(this);
+      // NOTE: Server decides the actual hit — we just play the animation and send input
     }
 
     if (this.actionCooldown > 0 && this.currentAction === 'attack-melee-right') {
@@ -219,18 +203,108 @@ export class Player {
     this.playAnimation(animToPlay, animToPlay !== 'attack-melee-right');
     this.mixer?.update(dt);
 
-    return {
-      pos: this.group.position,
-      rot: this.group.rotation.y,
-      anim: this.currentAction,
-      state: this.role,
-      t: Date.now(),
-      powerups: this.activePowerups
+    return { move, action };
+  }
+
+  // ---- Server reconciliation (called when a snapshot arrives for the local player) ----
+  // serverPos is the authoritative position the server recorded for us at serverTick.
+  reconcile(serverPos, serverTick) {
+    const dx = serverPos.x - this.group.position.x;
+    const dz = serverPos.z - this.group.position.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    if (dist < 0.05) return; // close enough, skip
+
+    // Lerp-correct rather than snap to avoid rubber-banding flicker
+    const alpha = Math.min(1, dist * 0.4); // stronger correction the further we are
+    this.group.position.x += (serverPos.x - this.group.position.x) * alpha;
+    this.group.position.z += (serverPos.z - this.group.position.z) * alpha;
+  }
+
+  // ---- Remote player snapshot ingestion ----
+  // Insert-sorted by tick so out-of-order UDP packets don't corrupt the buffer.
+  applyNetworkState(state) {
+    // Role change triggers infect animation
+    if (state.role !== this.role && !this.isDead) {
+      if (state.role === 'zombie') this.infect();
+    }
+
+    // Drop stale snapshots (older than our current render position)
+    if (state.tick <= this._lastAppliedTick - INTERP_DELAY_TICKS) return;
+
+    const entry = {
+      tick: state.tick,
+      pos: new THREE.Vector3(state.x, 0, state.z),
+      rot: state.rotY,
+      anim: state.anim,
+      powerups: state.powerups,
     };
+
+    // Insert-sort ascending by tick
+    let inserted = false;
+    for (let i = this.snapshots.length - 1; i >= 0; i--) {
+      if (this.snapshots[i].tick <= entry.tick) {
+        this.snapshots.splice(i + 1, 0, entry);
+        inserted = true;
+        break;
+      }
+    }
+    if (!inserted) this.snapshots.unshift(entry);
+
+    // Keep buffer bounded — drop very old entries
+    while (this.snapshots.length > 20) this.snapshots.shift();
+  }
+
+  // ---- Remote player interpolation (tick-based, no Date.now()) ----
+  updateRemote(dt, currentServerTick) {
+    // The tick we want to render: server's current tick minus delay
+    const renderTick = currentServerTick - INTERP_DELAY_TICKS;
+
+    // Drop snapshots that are now behind the render window
+    while (this.snapshots.length > 2 && this.snapshots[1].tick <= renderTick) {
+      this._lastAppliedTick = this.snapshots[0].tick;
+      this.snapshots.shift();
+    }
+
+    if (this.snapshots.length >= 2) {
+      const a = this.snapshots[0];
+      const b = this.snapshots[1];
+      const span = (b.tick - a.tick) || 1;
+      const alpha = Math.max(0, Math.min(1, (renderTick - a.tick) / span));
+
+      this.targetPos.lerpVectors(a.pos, b.pos, alpha);
+
+      let diff = b.rot - a.rot;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      this.targetRot = a.rot + diff * alpha;
+
+      if (!this.isDead && b.anim) {
+        this.playAnimation(b.anim, b.anim !== 'attack-melee-right' && b.anim !== 'die');
+      }
+
+      this.group.position.copy(this.targetPos);
+      this.group.rotation.y = this.targetRot;
+
+    } else if (this.snapshots.length === 1) {
+      this.group.position.lerp(this.snapshots[0].pos, 10 * dt);
+    }
+
+    this.mixer?.update(dt);
+
+    // Apply powerup visuals from latest snapshot
+    if (this.snapshots.length >= 1) {
+      const latest = this.snapshots[this.snapshots.length - 1];
+      if (latest.powerups) {
+        this.activePowerups.speed = !!latest.powerups.speed;
+        this.activePowerups.shield = !!latest.powerups.shield;
+        this.activePowerups.aura = !!latest.powerups.aura;
+      }
+    }
+
+    this.updateVisualEffects(dt);
   }
 
   updateVisualEffects(dt) {
-    // Shield/Aura
     if (this.activePowerups.shield || this.activePowerups.aura) {
       this.shieldMesh.material = this.role === 'zombie' ? this.shieldMatZombie : this.shieldMatSurvivor;
       this.shieldMesh.material.opacity = 0.6 + Math.sin(Date.now() * 0.005) * 0.2;
@@ -239,7 +313,6 @@ export class Player {
       this.shieldMesh.material.opacity = 0;
     }
 
-    // Speed Trail
     if (this.activePowerups.speed && (Math.abs(this.group.position.x - this.targetPos.x) > 0.1 || this.mixer)) {
       if (Math.random() < 0.4) {
         const trail = new THREE.Mesh(this.trailGeo, this.trailMat.clone());
@@ -261,70 +334,6 @@ export class Player {
         this.trails.splice(i, 1);
       }
     }
-  }
-
-  // Push an authoritative snapshot into the interpolation buffer instead of
-  // snapping targetPos directly — smooths out uneven packet arrival.
-  applyNetworkState(state) {
-    if (state.state !== this.role && !this.isDead) {
-      if (state.state === 'zombie') this.infect();
-    }
-
-    this.snapshots.push({
-      t: state.t || Date.now(),
-      pos: new THREE.Vector3(state.pos.x, state.pos.y, state.pos.z),
-      rot: state.rot,
-      anim: state.anim,
-      powerups: state.powerups
-    });
-    // Keep buffer bounded
-    if (this.snapshots.length > 20) this.snapshots.shift();
-  }
-
-  updateRemote(dt) {
-    const renderTime = Date.now() - INTERP_DELAY_MS;
-
-    // Find the two snapshots surrounding renderTime
-    while (this.snapshots.length > 2 && this.snapshots[1].t <= renderTime) {
-      this.snapshots.shift();
-    }
-
-    if (this.snapshots.length >= 2) {
-      const a = this.snapshots[0];
-      const b = this.snapshots[1];
-      const span = b.t - a.t || 1;
-      const alpha = Math.max(0, Math.min(1, (renderTime - a.t) / span));
-
-      this.targetPos.lerpVectors(a.pos, b.pos, alpha);
-
-      let diff = b.rot - a.rot;
-      while (diff < -Math.PI) diff += Math.PI * 2;
-      while (diff > Math.PI) diff -= Math.PI * 2;
-      this.targetRot = a.rot + diff * alpha;
-
-      if (!this.isDead && b.anim) {
-        this.playAnimation(b.anim, b.anim !== 'attack-melee-right' && b.anim !== 'die');
-      }
-
-      this.group.position.copy(this.targetPos);
-      this.group.rotation.y = this.targetRot;
-    } else if (this.snapshots.length === 1) {
-      // Not enough history yet — fall back to a gentle lerp toward the one point we have
-      this.group.position.lerp(this.snapshots[0].pos, 10 * dt);
-    }
-
-    if (this.mixer) this.mixer.update(dt);
-    
-    if (this.snapshots.length >= 1) {
-       const latest = this.snapshots[this.snapshots.length - 1];
-       if (latest.powerups) {
-         this.activePowerups.speed = latest.powerups.speed;
-         this.activePowerups.shield = latest.powerups.shield;
-         this.activePowerups.aura = latest.powerups.aura;
-       }
-    }
-    
-    this.updateVisualEffects(dt);
   }
 
   destroy() {

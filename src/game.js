@@ -4,12 +4,9 @@ import { World } from './world.js';
 import { InputManager } from './input.js';
 import { AudioManager } from './audio.js';
 
-const ROUND_MS = 3 * 60 * 1000;
-
 export class Game {
-  constructor(network, isHost) {
+  constructor(network) {
     this.network = network;
-    this.isHost = isHost;
 
     this.container = document.getElementById('game-container');
     this.timerEl = document.getElementById('round-timer');
@@ -45,9 +42,9 @@ export class Game {
     this.players = new Map();
     this.localPlayerId = this.network.myId;
 
+    // Client-side inventory (server confirms grants, client holds count)
     this.inventory = { speed: 0, shield: 0, trap: 0 };
     this.activePowerups = { speed: 0, shield: 0, aura: 0 };
-    this.powerupTimer = 5; // Spawn first powerup after 5s
 
     this.isRunning = false;
     this.isPaused = false;
@@ -55,18 +52,30 @@ export class Game {
     this._lastCountdownBeep = -1;
     this.spectateIndex = 0;
 
-    this.network.onPeerData = this.handleFastData.bind(this);
-    this.network.onReliableData = this.handleReliableData.bind(this);
+    // Server tick tracking for interpolation
+    this.serverTick = 0;
+    this._lastInputSend = 0;
+
+    // Network callbacks
+    this.network.onSnapshot = this.handleSnapshot.bind(this);
+    this.network.onServerEvent = this.handleServerEvent.bind(this);
     this.network.onChatMessage = this.handleChatMessage.bind(this);
     this.network.onPingUpdate = () => this.updatePingHUD();
 
+    // Input callbacks
     this.input.onPause = () => this.togglePause();
     this.input.onMuteToggle = () => this.toggleMute();
     this.input.onChatFocus = () => this.chatInputEl?.focus();
 
     window.addEventListener('resize', this.onWindowResize.bind(this));
+
+    // Auto-pause on tab hide, auto-resume on tab show
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden && this.isRunning) this.setPaused(true, true);
+      if (document.hidden && this.isRunning) {
+        this.setPaused(true, true);
+      } else if (!document.hidden && this.isPaused && this.isRunning) {
+        this.setPaused(false);
+      }
     });
 
     this.chatInputEl?.addEventListener('keydown', (e) => {
@@ -82,19 +91,29 @@ export class Game {
     document.getElementById('slot-speed')?.addEventListener('pointerdown', () => this.usePowerup('speed'));
     document.getElementById('slot-shield')?.addEventListener('pointerdown', () => this.usePowerup('shield'));
     document.getElementById('slot-trap')?.addEventListener('pointerdown', () => this.usePowerup('trap'));
+    document.getElementById('btn-pause')?.addEventListener('click', () => this.togglePause());
   }
 
+  // ---- Start / Stop ----
+
   async start(initialState, onProgress) {
-    await this.world.init(onProgress);
-    this.world.setGameRef(this);
+    const seed = initialState.seed || initialState.code || 'DEFAULT';
+    await this.world.init(onProgress, seed);
 
     this.startTime = initialState.startTime;
+    const roundMs = (initialState.roundTime || 180) * 1000;
+    this.roundEndTime = initialState.startTime + roundMs + 2000;
 
+    // Spawn all players
+    const positions = initialState.positions || [];
     initialState.players.forEach((id, index) => {
-      const angle = (index / initialState.players.length) * Math.PI * 2;
       const role = initialState.zombies.includes(id) ? 'zombie' : 'survivor';
-      const pos = new THREE.Vector3(Math.cos(angle) * 3, 0, Math.sin(angle) * 3);
-      this.spawnPlayer(id, role, pos);
+      const posData = positions.find(p => p.id === id);
+      const pos = posData
+        ? new THREE.Vector3(posData.x, 0, posData.z)
+        : new THREE.Vector3(Math.cos((index / initialState.players.length) * Math.PI * 2) * 3, 0,
+                            Math.sin((index / initialState.players.length) * Math.PI * 2) * 3);
+      this.spawnPlayer(id, role, pos, initialState.playerNames);
     });
 
     this.pushKillFeed(initialState.zombies.includes(this.localPlayerId)
@@ -104,38 +123,26 @@ export class Game {
     this.updateHUD();
     this.updateActionButtons();
 
-    const roundMs = (initialState.roundTime || 180) * 1000;
-    this.roundEndTime = initialState.startTime + roundMs + 2000;
-
     this.isRunning = true;
     this.isPaused = false;
     this.renderer.setAnimationLoop(this.animate.bind(this));
 
-    window.addEventListener('wheel', (e) => {
-      this.applyZoom(e.deltaY > 0 ? 1 : -1, 0.5);
-    });
-
-    const btnZoomIn = document.getElementById('btn-zoom-in');
-    const btnZoomOut = document.getElementById('btn-zoom-out');
-    btnZoomIn?.addEventListener('click', () => this.applyZoom(-1, 2.0));
-    btnZoomOut?.addEventListener('click', () => this.applyZoom(1, 2.0));
-
+    window.addEventListener('wheel', (e) => { this.applyZoom(e.deltaY > 0 ? 1 : -1, 0.5); });
+    document.getElementById('btn-zoom-in')?.addEventListener('click', () => this.applyZoom(-1, 2.0));
+    document.getElementById('btn-zoom-out')?.addEventListener('click', () => this.applyZoom(1, 2.0));
     this.setupPinchZoom();
-
-    if (this.isHost) {
-      this.syncInterval = setInterval(() => this.checkWinConditions(), 1000);
-    }
   }
 
-  spawnPlayer(id, role, position = null) {
-    const dName = this.network.playerNames.get(id) || `Player ${id.slice(0, 4)}`;
-    const player = new Player(id, role, this.scene, this.world.assets, id === this.localPlayerId ? 'You' : dName);
-    if (position) {
-      player.group.position.copy(position);
-    } else {
-      const angle = Math.random() * Math.PI * 2;
-      player.group.position.set(Math.cos(angle) * 3, 0, Math.sin(angle) * 3);
+  spawnPlayer(id, role, position = null, playerNames = null) {
+    // Resolve display name: from initialState.playerNames array, or network map
+    let dName = this.network.playerNames.get(id) || `Player ${id.slice(0, 4)}`;
+    if (playerNames) {
+      const entry = playerNames.find(p => p.id === id);
+      if (entry) dName = entry.name;
     }
+    const label = id === this.localPlayerId ? 'You' : dName;
+    const player = new Player(id, role, this.scene, this.world.assets, label);
+    if (position) player.group.position.copy(position);
 
     if (id === this.localPlayerId) {
       player.onFootstep = () => this.audio.footstep();
@@ -144,6 +151,15 @@ export class Game {
 
     this.players.set(id, player);
     return player;
+  }
+
+  removePlayer(id) {
+    const player = this.players.get(id);
+    if (player) {
+      player.destroy();
+      this.players.delete(id);
+    }
+    this.updateHUD();
   }
 
   applyZoom(dir, amount) {
@@ -161,16 +177,12 @@ export class Game {
         initialDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
       }
     }, { passive: true });
-    
     this.container.addEventListener('touchmove', (e) => {
       if (e.touches.length === 2) {
         const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
         if (initialDist > 0) {
           const delta = initialDist - dist;
-          if (Math.abs(delta) > 5) {
-            this.applyZoom(delta > 0 ? 1 : -1, 0.5);
-            initialDist = dist;
-          }
+          if (Math.abs(delta) > 5) { this.applyZoom(delta > 0 ? 1 : -1, 0.5); initialDist = dist; }
         }
       }
     }, { passive: true });
@@ -179,26 +191,26 @@ export class Game {
   stop() {
     this.isRunning = false;
     this.renderer.setAnimationLoop(null);
-    if (this.syncInterval) clearInterval(this.syncInterval);
     this.audio.stopAll();
     this.players.forEach((p) => p.destroy());
     this.players.clear();
     this.container.innerHTML = '';
   }
 
-  togglePause() {
-    this.setPaused(!this.isPaused);
-  }
+  togglePause() { this.setPaused(!this.isPaused); }
 
   setPaused(paused, silent = false) {
     if (!this.isRunning) return;
     this.isPaused = paused;
+    const btn = document.getElementById('btn-pause');
     if (paused) {
       this.renderer.setAnimationLoop(null);
-      if (!silent) this.pushKillFeed('Paused — press Esc to resume');
+      if (btn) btn.textContent = '▶';
+      if (!silent) this.pushKillFeed('Paused — press Esc or ▶ to resume');
     } else {
-      this.clock.getDelta(); // discard the accumulated gap so dt doesn't spike
+      this.clock.getDelta(); // discard accumulated gap so dt doesn't spike
       this.renderer.setAnimationLoop(this.animate.bind(this));
+      if (btn) btn.textContent = '⏸';
     }
   }
 
@@ -210,55 +222,130 @@ export class Game {
 
   // ---- Networking ----
 
-  handleFastData(senderId, data) {
-    if (data.type === 'state_update') {
-      const peerId = data.peerId || senderId;
-      const player = this.players.get(peerId);
-      if (player && peerId !== this.localPlayerId) {
-        player.applyNetworkState(data.state);
+  /**
+   * Server sends a snapshot every 50ms containing all player positions.
+   * We feed remote players into the interpolation buffer and reconcile
+   * the local player's predicted position against the authoritative one.
+   */
+  handleSnapshot(data) {
+    this.serverTick = data.tick;
+
+    for (const state of data.players) {
+      const player = this.players.get(state.id);
+      if (!player) continue;
+
+      if (state.id === this.localPlayerId) {
+        // Reconcile local prediction with server position
+        player.reconcile({ x: state.x, z: state.z }, state.tick);
+        // Update role if server says we changed
+        if (state.role !== player.role && !player.isDead) {
+          if (state.role === 'zombie') player.infect();
+        }
+        // Update local powerup visuals from server truth
+        if (state.powerups) {
+          player.activePowerups.speed = !!state.powerups.speed;
+          player.activePowerups.shield = !!state.powerups.shield;
+          player.activePowerups.aura = !!state.powerups.aura;
+        }
+      } else {
+        // Remote player — feed into interpolation buffer
+        player.applyNetworkState(state);
       }
     }
   }
 
-  handleReliableData(senderId, data) {
-    if (data.type === 'infect_event') {
-      const targetPlayer = this.players.get(data.targetId);
-      if (targetPlayer && targetPlayer.role === 'survivor' && !targetPlayer.isDead) {
-        targetPlayer.infect(); // Updates to zombie immediately
-        this.audio.infectHit();
-        if (data.targetId === this.localPlayerId) {
-          this.audio.becomeZombie();
-          this.flashVignette();
+  /**
+   * Reliable server events (infect, powerup, trap, etc.)
+   */
+  handleServerEvent(data) {
+    switch (data.type) {
+      case 'infect_event': {
+        const target = this.players.get(data.targetId);
+        if (target && target.role === 'survivor' && !target.isDead) {
+          target.infect();
+          this.audio.infectHit();
+          if (data.targetId === this.localPlayerId) {
+            this.audio.becomeZombie();
+            this.flashVignette();
+          }
+          this.pushKillFeed(`${this.nameFor(data.targetId)} was infected!`);
+          this.updateActionButtons();
+          this.updateHUD();
         }
-        this.pushKillFeed(`${this.nameFor(data.targetId)} was infected!`);
-        this.updateActionButtons(); // Update right away so they can infect
-        this.updateHUD();
+        break;
       }
-    } else if (data.type === 'player_spawn') {
-      if (!this.players.has(data.id)) {
-        this.spawnPlayer(data.id, data.role);
-        this.pushKillFeed(`${this.nameFor(data.id)} joined late!`);
-        this.updateHUD();
+
+      case 'role_changed': {
+        const p = this.players.get(data.playerId);
+        if (p && p.role !== data.role) {
+          // Server confirms a role change (after infect delay)
+          if (data.role === 'zombie' && p.isDead) {
+            // The infect() timeout already handles the visual; just sync role
+            p.role = 'zombie';
+          }
+          this.updateHUD();
+        }
+        break;
       }
-    } else if (data.type === 'spawn_powerup') {
-      this.world.spawnPowerup(data.id, data.x, data.z);
-    } else if (data.type === 'claim_powerup') {
-      this.world.removePowerup(data.id);
-    } else if (data.type === 'use_powerup') {
-      // Show visual effect for other players
-      this.pushKillFeed(`${this.nameFor(senderId)} used ${data.powerup}!`);
-      if (data.powerup === 'trap') {
-        const isEnemy = this.players.get(this.localPlayerId)?.role !== data.role;
-        this.world.spawnTrap(data.trapId, data.x, data.z, data.role, isEnemy);
+
+      case 'player_spawn': {
+        if (!this.players.has(data.id)) {
+          this.spawnPlayer(data.id, data.role || 'survivor', null, data.playerNames);
+          this.pushKillFeed(`${this.nameFor(data.id)} joined late!`);
+          this.updateHUD();
+        }
+        break;
       }
-    } else if (data.type === 'trap_trigger') {
-      this.world.removeTrap(data.trapId);
-      const targetPlayer = this.players.get(data.targetId);
-      if (targetPlayer && data.targetId === this.localPlayerId) {
-         this.pushKillFeed(`You hit a trap!`);
-         targetPlayer.actionCooldown = 3.0; // Stun
-         targetPlayer.playAnimation('die', false); // Dazed anim
+
+      case 'powerup_spawned': {
+        this.world.spawnPowerup(data.id, data.x, data.z);
+        break;
       }
+
+      case 'powerup_claimed': {
+        this.world.removePowerup(data.id);
+        if (data.claimerId === this.localPlayerId && data.granted) {
+          this.inventory[data.granted] = (this.inventory[data.granted] || 0) + 1;
+          this.updatePowerupUI();
+          this.audio.infectHit();
+          this.showPowerupAnimation(data.granted);
+        }
+        break;
+      }
+
+      case 'use_powerup': {
+        this.pushKillFeed(`${this.nameFor(data.senderId)} used ${data.powerup}!`);
+        if (data.powerup === 'trap' && data.trapId) {
+          const localRole = this.players.get(this.localPlayerId)?.role;
+          const isEnemy = localRole !== data.role;
+          this.world.spawnTrap(data.trapId, data.x, data.z, data.role, isEnemy);
+        }
+        // Apply local powerup timers if this is for us (server already set them)
+        if (data.senderId === this.localPlayerId) {
+          if (data.powerup === 'speed') this.activePowerups.speed = 5.0;
+          else if (data.powerup === 'shield') {
+            const local = this.players.get(this.localPlayerId);
+            if (local?.role === 'zombie') this.activePowerups.aura = 10.0;
+            else this.activePowerups.shield = 8.0;
+          }
+        }
+        break;
+      }
+
+      case 'trap_trigger': {
+        this.world.removeTrap(data.trapId);
+        if (data.targetId === this.localPlayerId) {
+          const local = this.players.get(this.localPlayerId);
+          if (local) {
+            this.pushKillFeed('You hit a trap!');
+            local.actionCooldown = 3.0;
+            local.playAnimation('die', false);
+          }
+        }
+        break;
+      }
+
+      default: break;
     }
   }
 
@@ -267,7 +354,8 @@ export class Game {
     const div = document.createElement('div');
     div.className = 'chat-line';
     const isMe = senderId === this.localPlayerId;
-    div.innerHTML = `<span class="chat-name">${isMe ? 'You' : this.nameFor(senderId)}:</span> ${this.escapeHtml(msg.text)}`;
+    const name = msg.senderName || (isMe ? 'You' : this.nameFor(senderId));
+    div.innerHTML = `<span class="chat-name">${isMe ? 'You' : name}:</span> ${this.escapeHtml(msg.text)}`;
     this.chatLogEl.appendChild(div);
     this.chatLogEl.scrollTop = this.chatLogEl.scrollHeight;
     while (this.chatLogEl.children.length > 30) this.chatLogEl.removeChild(this.chatLogEl.firstChild);
@@ -281,7 +369,8 @@ export class Game {
 
   nameFor(id) {
     const p = this.players.get(id);
-    return p ? p.displayName : `Player ${id.slice(0, 4)}`;
+    if (p) return p.displayName;
+    return this.network.playerNames.get(id) || `Player ${id.slice(0, 4)}`;
   }
 
   pushKillFeed(text) {
@@ -328,25 +417,20 @@ export class Game {
     const sSlot = document.getElementById('slot-speed');
     const shSlot = document.getElementById('slot-shield');
     const tSlot = document.getElementById('slot-trap');
-    
-    if (sSlot) { sSlot.classList.toggle('hidden', this.inventory.speed === 0); document.getElementById('count-speed').textContent = this.inventory.speed; }
-    if (shSlot) { 
-      shSlot.classList.toggle('hidden', this.inventory.shield === 0); 
+
+    if (sSlot) {
+      sSlot.classList.toggle('hidden', this.inventory.speed === 0);
+      document.getElementById('count-speed').textContent = this.inventory.speed;
+    }
+    if (shSlot) {
+      shSlot.classList.toggle('hidden', this.inventory.shield === 0);
       document.getElementById('count-shield').textContent = this.inventory.shield;
       const localRole = this.players.get(this.localPlayerId)?.role;
       shSlot.querySelector('.p-icon').textContent = localRole === 'zombie' ? '🦠' : '🛡️';
     }
-    if (tSlot) { tSlot.classList.toggle('hidden', this.inventory.trap === 0); document.getElementById('count-trap').textContent = this.inventory.trap; }
-  }
-
-  grantRandomPowerup() {
-    const types = ['speed', 'shield', 'trap'];
-    const selected = types[Math.floor(Math.random() * types.length)];
-    if (this.inventory[selected] < 3) {
-      this.inventory[selected]++;
-      this.updatePowerupUI();
-      this.audio.infectHit(); // Use as pickup sound
-      this.showPowerupAnimation(selected);
+    if (tSlot) {
+      tSlot.classList.toggle('hidden', this.inventory.trap === 0);
+      document.getElementById('count-trap').textContent = this.inventory.trap;
     }
   }
 
@@ -354,29 +438,21 @@ export class Game {
     const ann = document.getElementById('powerup-announcement');
     const fly = document.getElementById('powerup-fly');
     if (!ann || !fly) return;
-
-    // Show announcement
     const names = { speed: 'Speed Boost!', shield: 'Shield!', trap: 'Trap!' };
     ann.textContent = names[type];
     ann.classList.remove('show');
-    void ann.offsetWidth; // trigger reflow
+    void ann.offsetWidth;
     ann.classList.add('show');
-
-    // Show fly animation
     const slotMap = { speed: 'slot-speed', shield: 'slot-shield', trap: 'slot-trap' };
     const slotEl = document.getElementById(slotMap[type]);
     if (slotEl) {
       const rect = slotEl.getBoundingClientRect();
-      const targetX = rect.left + rect.width / 2;
-      const targetY = rect.top + rect.height / 2;
-      fly.style.setProperty('--target-x', `${targetX}px`);
-      fly.style.setProperty('--target-y', `${targetY}px`);
-      
+      fly.style.setProperty('--target-x', `${rect.left + rect.width / 2}px`);
+      fly.style.setProperty('--target-y', `${rect.top + rect.height / 2}px`);
       fly.classList.remove('hidden');
       fly.style.animation = 'none';
-      void fly.offsetWidth; // trigger reflow
+      void fly.offsetWidth;
       fly.style.animation = 'flyToSlot 0.8s cubic-bezier(0.5, 0, 0.75, 0) forwards';
-      
       setTimeout(() => fly.classList.add('hidden'), 800);
     }
   }
@@ -390,18 +466,21 @@ export class Game {
     if (!localPlayer) return;
 
     let trapId = null;
-
-    if (type === 'speed') {
-       this.activePowerups.speed = 5.0; // 5 seconds
-    } else if (type === 'shield') {
-       if (localPlayer.role === 'zombie') this.activePowerups.aura = 10.0;
-       else this.activePowerups.shield = 8.0;
-    } else if (type === 'trap') {
-       trapId = 'trap_' + Math.random().toString(36).substring(7);
-       this.world.spawnTrap(trapId, localPlayer.group.position.x, localPlayer.group.position.z, localPlayer.role, false);
+    if (type === 'trap') {
+      trapId = 'trap_' + Math.random().toString(36).substring(7);
+      // Optimistic: spawn trap visually immediately on own client
+      this.world.spawnTrap(trapId, localPlayer.group.position.x, localPlayer.group.position.z, localPlayer.role, false);
     }
-    
-    this.network.sendReliable({ type: 'use_powerup', powerup: type, role: localPlayer.role, x: localPlayer.group.position.x, z: localPlayer.group.position.z, trapId });
+
+    // Tell server — server applies the effect and broadcasts to everyone
+    this.network.sendReliable({
+      type: 'use_powerup',
+      powerup: type,
+      role: localPlayer.role,
+      x: localPlayer.group.position.x,
+      z: localPlayer.group.position.z,
+      trapId,
+    });
   }
 
   updatePingHUD() {
@@ -412,8 +491,7 @@ export class Game {
   }
 
   updateHUD() {
-    let s = 0;
-    let z = 0;
+    let s = 0, z = 0;
     this.players.forEach((p) => {
       if (p.role === 'survivor' && !p.isDead && !p.isExtracted) s++;
       if (p.role === 'zombie') z++;
@@ -425,93 +503,164 @@ export class Game {
   }
 
   updateSpectatorBanner() {
-    const localPlayer = this.players.get(this.localPlayerId);
+    const local = this.players.get(this.localPlayerId);
     if (!this.spectatorBannerEl) return;
-    const spectating = localPlayer && (localPlayer.isExtracted || (localPlayer.isDead && localPlayer.role !== 'zombie'));
+    const spectating = local && (local.isExtracted || (local.isDead && local.role !== 'zombie'));
     this.spectatorBannerEl.classList.toggle('hidden', !spectating);
   }
 
+  // ---- Minimap — player-centered, top-right, with facing arrow ----
   drawMinimap() {
     if (!this.minimapCtx) return;
     const ctx = this.minimapCtx;
-    const size = this.minimapCanvas.width;
-    const data = this.world.getMinimapData();
-    const scale = size / (data.half * 2);
-    const toMap = (x, z) => [size / 2 + x * scale, size / 2 + z * scale];
+    const size = this.minimapCanvas.width;   // 200
+    const VIEW_HALF = 14;                    // world units visible from center
+    const scale = size / (VIEW_HALF * 2);
+
+    const localPlayer = this.players.get(this.localPlayerId);
+    const cx = localPlayer ? localPlayer.group.position.x : 0;
+    const cz = localPlayer ? localPlayer.group.position.z : 0;
+    const facing = localPlayer ? localPlayer.group.rotation.y : 0;
+
+    // World → canvas coords (centered on local player)
+    const toMap = (wx, wz) => [
+      size / 2 + (wx - cx) * scale,
+      size / 2 + (wz - cz) * scale,
+    ];
 
     ctx.clearRect(0, 0, size, size);
-    ctx.fillStyle = 'rgba(15, 23, 42, 0.55)';
+
+    // Background
+    ctx.fillStyle = 'rgba(10, 15, 30, 0.75)';
     ctx.beginPath();
-    ctx.arc(size / 2, size / 2, size / 2, 0, Math.PI * 2);
+    ctx.roundRect(0, 0, size, size, 14);
     ctx.fill();
 
-    // Props
-    ctx.fillStyle = 'rgba(148, 163, 184, 0.5)';
+    // Draw maze walls as line segments
+    const data = this.world.getMinimapData();
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.6)';
+    ctx.lineWidth = 2;
     data.props.forEach((p) => {
+      if (!p.isWall) return;
+      const hw = (p.w || 1) / 2;
+      const hd = (p.d || 1) / 2;
+      const [ax, az] = toMap(p.x - hw, p.z - hd);
+      const [bx, bz] = toMap(p.x + hw, p.z + hd);
+      ctx.fillStyle = 'rgba(100, 116, 139, 0.7)';
+      ctx.fillRect(ax, az, bx - ax, bz - az);
+    });
+
+    // Draw obstacles (only those within the view window)
+    ctx.fillStyle = 'rgba(100, 116, 139, 0.35)';
+    data.props.forEach((p) => {
+      if (p.isWall) return;
+      if (Math.abs(p.x - cx) > VIEW_HALF + 2 || Math.abs(p.z - cz) > VIEW_HALF + 2) return;
       const [px, pz] = toMap(p.x, p.z);
       ctx.beginPath();
-      ctx.arc(px, pz, 1.6, 0, Math.PI * 2);
+      ctx.arc(px, pz, 2, 0, Math.PI * 2);
       ctx.fill();
     });
 
-    // Players
-    this.players.forEach((p, id) => {
-      if (p.isExtracted || (p.isDead && p.role !== 'zombie' && id !== this.localPlayerId)) return;
-      const [px, pz] = toMap(p.group.position.x, p.group.position.z);
-      ctx.fillStyle = id === this.localPlayerId ? '#f8fafc' : p.role === 'zombie' ? '#ef4444' : '#10b981';
+    // Arena boundary indicator (subtle lines at edge)
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.3)';
+    ctx.lineWidth = 1;
+    const ARENA_HALF = 25;
+    // Draw the boundary walls if they're in view
+    [[-ARENA_HALF, -ARENA_HALF, ARENA_HALF, -ARENA_HALF],
+     [ARENA_HALF, -ARENA_HALF, ARENA_HALF, ARENA_HALF],
+     [ARENA_HALF, ARENA_HALF, -ARENA_HALF, ARENA_HALF],
+     [-ARENA_HALF, ARENA_HALF, -ARENA_HALF, -ARENA_HALF]].forEach(([x1, z1, x2, z2]) => {
+      const [ax, ay] = toMap(x1, z1);
+      const [bx, by] = toMap(x2, z2);
       ctx.beginPath();
-      ctx.arc(px, pz, id === this.localPlayerId ? 4 : 3, 0, Math.PI * 2);
-      ctx.fill();
+      ctx.moveTo(ax, ay);
+      ctx.lineTo(bx, by);
+      ctx.stroke();
+    });
+
+    // Draw players
+    this.players.forEach((p, id) => {
+      // During the 2s infect transform, keep dead players visible on minimap
+      if (p.isExtracted) return;
+      const [px, pz] = toMap(p.group.position.x, p.group.position.z);
+      // Skip if outside view
+      if (px < -10 || px > size + 10 || pz < -10 || pz > size + 10) return;
+
+      if (id === this.localPlayerId) {
+        // "You" — white dot with facing arrow
+        ctx.fillStyle = '#f8fafc';
+        ctx.beginPath();
+        ctx.arc(size / 2, size / 2, 5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Facing arrow
+        ctx.save();
+        ctx.translate(size / 2, size / 2);
+        ctx.rotate(facing);
+        ctx.fillStyle = '#f8fafc';
+        ctx.beginPath();
+        ctx.moveTo(0, -10);
+        ctx.lineTo(4, -4);
+        ctx.lineTo(-4, -4);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      } else {
+        const color = p.role === 'zombie' ? '#ef4444' : '#10b981';
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(px, pz, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Pulse ring for nearby zombies
+        if (p.role === 'zombie') {
+          const dist = Math.hypot(p.group.position.x - cx, p.group.position.z - cz);
+          if (dist < 12) {
+            ctx.strokeStyle = `rgba(239, 68, 68, ${0.6 * (1 - dist / 12)})`;
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.arc(px, pz, 7, 0, Math.PI * 2);
+            ctx.stroke();
+          }
+        }
+      }
     });
 
     // Border
     ctx.strokeStyle = 'rgba(255,255,255,0.15)';
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 1.5;
     ctx.beginPath();
-    ctx.arc(size / 2, size / 2, size / 2 - 1, 0, Math.PI * 2);
+    ctx.roundRect(0.75, 0.75, size - 1.5, size - 1.5, 13);
     ctx.stroke();
   }
 
   updateProximityHeartbeat() {
-    const localPlayer = this.players.get(this.localPlayerId);
-    if (!localPlayer || localPlayer.role !== 'survivor' || localPlayer.isDead || localPlayer.isExtracted) {
+    const local = this.players.get(this.localPlayerId);
+    if (!local || local.role !== 'survivor' || local.isDead || local.isExtracted) {
       this.audio.setHeartbeatIntensity(0);
       return;
     }
     let nearestDist = Infinity;
     this.players.forEach((p) => {
       if (p.role === 'zombie') {
-        const d = p.group.position.distanceTo(localPlayer.group.position);
+        const d = p.group.position.distanceTo(local.group.position);
         if (d < nearestDist) nearestDist = d;
       }
     });
     const threshold = 12;
-    const intensity = nearestDist >= threshold ? 0 : 1 - nearestDist / threshold;
-    this.audio.setHeartbeatIntensity(intensity);
-  }
-
-  checkWinConditions() {
-    if (!this.isRunning || !this.isHost) return;
-
-    const counts = this.updateHUD();
-    const now = Date.now();
-    const remain = Math.max(0, this.roundEndTime - now);
-
-    if (counts.survivors === 0) {
-      this.network.broadcast({ type: 'game_end', result: 'zombies' }, null, true);
-      this.handleGameOver('zombies');
-    } else if (remain <= 0 && counts.survivors > 0) {
-      this.network.broadcast({ type: 'game_end', result: 'survivors' }, null, true);
-      this.handleGameOver('survivors');
-    }
+    this.audio.setHeartbeatIntensity(nearestDist >= threshold ? 0 : 1 - nearestDist / threshold);
   }
 
   handleGameOver(result) {
     this.isRunning = false;
-    this.audio.gameEnd(result === 'survivors' ? this.players.get(this.localPlayerId)?.role !== 'zombie' : this.players.get(this.localPlayerId)?.role === 'zombie');
+    // Stop the render loop immediately — don't leave it ticking as a no-op
+    this.renderer.setAnimationLoop(null);
+    this.audio.gameEnd(result === 'survivors'
+      ? this.players.get(this.localPlayerId)?.role !== 'zombie'
+      : this.players.get(this.localPlayerId)?.role === 'zombie');
   }
 
-  // ---- Loop ----
+  // ---- Main loop ----
 
   animate() {
     if (!this.isRunning || this.isPaused) return;
@@ -523,59 +672,39 @@ export class Game {
     const spectating = localPlayer && (localPlayer.isExtracted || (localPlayer.role !== 'zombie' && localPlayer.isDead));
 
     if (localPlayer && !spectating) {
-      // Apply active powerups
+      // Apply speed powerup to local player's speed
       const baseSpeed = localPlayer.role === 'zombie' ? 5.5 : 5.0;
       localPlayer.speed = this.activePowerups.speed > 0 ? baseSpeed * 1.5 : baseSpeed;
-      
+
+      // Cooldown UI progress
       const speedPct = this.activePowerups.speed > 0 ? (this.activePowerups.speed / 5.0) * 100 : 0;
       const shieldMax = localPlayer.role === 'zombie' ? 10.0 : 8.0;
       const shieldVal = localPlayer.role === 'zombie' ? this.activePowerups.aura : this.activePowerups.shield;
       const shieldPct = shieldVal > 0 ? (shieldVal / shieldMax) * 100 : 0;
-      
       document.getElementById('slot-speed')?.style.setProperty('--cooldown-pct', `${100 - speedPct}%`);
       document.getElementById('slot-shield')?.style.setProperty('--cooldown-pct', `${100 - shieldPct}%`);
 
-      const state = localPlayer.updateLocal(dt, this.input, this.world, this.activePowerups);
+      // Update local player with client-side prediction
+      const { move, action } = localPlayer.updateLocal(dt, this.input, this.world, this.activePowerups);
 
-      if (!this.lastSend || performance.now() - this.lastSend > 33) {
-        this.network.sendData({ type: 'state_update', state });
-        this.lastSend = performance.now();
+      // Send input to server at ~30Hz
+      if (performance.now() - this._lastInputSend > 33) {
+        this.network.sendInput(move, action);
+        this._lastInputSend = performance.now();
       }
 
-      // Check powerup collection
-      for (const [id, mesh] of this.world.powerups.entries()) {
-        if (localPlayer.group.position.distanceTo(mesh.position) < 1.5) {
-          this.world.removePowerup(id);
-          this.network.sendReliable({ type: 'claim_powerup', id });
-          this.grantRandomPowerup();
-        }
-      }
-
-      // Check trap collision
-      for (const [id, trap] of this.world.traps.entries()) {
-        if (trap.role !== localPlayer.role) {
-          const dist = Math.hypot(localPlayer.group.position.x - trap.x, localPlayer.group.position.z - trap.z);
-          if (dist < 1.0) {
-            this.world.removeTrap(id);
-            this.network.sendReliable({ type: 'trap_trigger', trapId: id, targetId: localPlayer.id });
-            this.handleReliableData(this.localPlayerId, { type: 'trap_trigger', trapId: id, targetId: localPlayer.id });
-          }
-        }
-      }
-
-      // Decrement timers
+      // Decrement local powerup timers (server is authoritative, but we run timers
+      // locally for smooth UI; server snapshot will reconcile discrepancies)
       if (this.activePowerups.speed > 0) this.activePowerups.speed -= dt;
       if (this.activePowerups.shield > 0) this.activePowerups.shield -= dt;
-      if (this.activePowerups.aura > 0) {
-         this.activePowerups.aura -= dt;
-         if (localPlayer.role === 'zombie') this.world.attemptInfect(localPlayer, 4.0);
-      }
+      if (this.activePowerups.aura > 0) this.activePowerups.aura -= dt;
 
+      // Camera follow
       const targetCamPos = localPlayer.group.position.clone().add(this.cameraOffset);
       this.camera.position.lerp(targetCamPos, 5 * dt);
       this.camera.lookAt(localPlayer.group.position);
+
     } else if (spectating) {
-      // Simple free-roam spectator camera following a living player, cycling with Space
       const alive = Array.from(this.players.values()).filter(p => !p.isDead && !p.isExtracted);
       if (alive.length) {
         if (this.input.isActionPressed() && !this._spectateLock) {
@@ -591,31 +720,17 @@ export class Game {
       }
     }
 
+    // Update remote players using server tick
     this.players.forEach((p, id) => {
-      if (id !== this.localPlayerId) p.updateRemote(dt);
+      if (id !== this.localPlayerId) p.updateRemote(dt, this.serverTick);
     });
 
     this.updateProximityHeartbeat();
     this.drawMinimap();
 
+    // Timer display
     const now = Date.now();
     const remain = Math.max(0, this.roundEndTime - now);
-
-    if (this.isHost) {
-      this.powerupTimer -= dt;
-      if (this.powerupTimer <= 0) {
-        const alivePlayers = Array.from(this.players.values()).filter(p => !p.isDead && !p.isExtracted).length;
-        const rate = Math.max(3, 12 - (alivePlayers * 1.5) - (remain < 60000 ? 3 : 0));
-        this.powerupTimer = rate;
-
-        const id = Math.random().toString(36).substring(7);
-        const px = (Math.random() - 0.5) * 44;
-        const pz = (Math.random() - 0.5) * 44;
-        this.network.sendReliable({ type: 'spawn_powerup', id, x: px, z: pz });
-        this.world.spawnPowerup(id, px, pz);
-      }
-    }
-    
     const mins = Math.floor(remain / 60000);
     const secs = Math.floor((remain % 60000) / 1000);
     if (this.timerEl) this.timerEl.textContent = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
@@ -628,8 +743,6 @@ export class Game {
         this.audio.countdownTick(secWhole <= 3);
       }
     }
-
-
 
     this.renderer.render(this.scene, this.camera);
   }
