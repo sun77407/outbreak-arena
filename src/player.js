@@ -172,7 +172,7 @@ export class Player {
    * @param {number}   seq             current input sequence number (from network)
    * @returns {{ move, action }}
    */
-  updateLocal(dt, input, world, activePowerups, flatColliders, seq) {
+  updateLocal(dt, input, world, activePowerups, flatColliders, seq, cameraYaw = Math.PI) {
     if (activePowerups) {
       this.activePowerups.speed  = activePowerups.speed  > 0;
       this.activePowerups.shield = activePowerups.shield > 0;
@@ -196,7 +196,21 @@ export class Player {
     if (this.actionCooldown > 0) this.actionCooldown -= dt;
 
     let animToPlay = 'idle';
-    const move = input.getMovement();
+    const rawMove = input.getMovement();
+    const move = { x: 0, y: 0 };
+
+    if (rawMove.x !== 0 || rawMove.y !== 0) {
+      const sin = Math.sin(cameraYaw);
+      const cos = Math.cos(cameraYaw);
+      move.x = rawMove.x * cos + rawMove.y * sin;
+      move.y = -rawMove.x * sin + rawMove.y * cos;
+
+      const len = Math.sqrt(move.x * move.x + move.y * move.y);
+      if (len > 1) {
+        move.x /= len;
+        move.y /= len;
+      }
+    }
 
     if (move.x !== 0 || move.y !== 0) {
       // Speed mirrors server gameTick() exactly

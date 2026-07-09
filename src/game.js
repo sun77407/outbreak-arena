@@ -26,7 +26,9 @@ export class Game {
     this.scene.fog = new THREE.FogExp2(0x0f172a, 0.04);
 
     this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
-    this.cameraOffset = new THREE.Vector3(0, 15, 12);
+    this.cameraYaw = Math.PI; // Face "forward"
+    this.cameraPitch = Math.PI / 8; // Look slightly down
+    this.cameraDistance = 6;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -102,6 +104,25 @@ export class Game {
       }
     });
 
+    // Pointer Lock for Mouse Look
+    this.renderer.domElement.addEventListener('click', () => {
+      if (this.isRunning && !this.isPaused) {
+        this.renderer.domElement.requestPointerLock();
+      }
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (document.pointerLockElement === this.renderer.domElement) {
+        this.cameraYaw -= e.movementX * 0.002;
+        this.cameraPitch -= e.movementY * 0.002;
+        
+        // Clamp pitch to avoid flipping over
+        const maxPitch = Math.PI / 2 - 0.1;
+        const minPitch = -Math.PI / 4;
+        this.cameraPitch = Math.max(minPitch, Math.min(maxPitch, this.cameraPitch));
+      }
+    });
+
     document.getElementById('slot-speed')?.addEventListener('pointerdown', () => this.usePowerup('speed'));
     document.getElementById('slot-shield')?.addEventListener('pointerdown', () => this.usePowerup('shield'));
     document.getElementById('slot-trap')?.addEventListener('pointerdown', () => this.usePowerup('trap'));
@@ -143,13 +164,6 @@ export class Game {
     this.isRunning = true;
     this.isPaused = false;
     this.renderer.setAnimationLoop(this.animate.bind(this));
-
-    // Bug #21 fix: store handler reference so it can be removed in stop()
-    this._wheelHandler = (e) => { this.applyZoom(e.deltaY > 0 ? 1 : -1, 0.5); };
-    window.addEventListener('wheel', this._wheelHandler);
-    document.getElementById('btn-zoom-in')?.addEventListener('click', () => this.applyZoom(-1, 2.0));
-    document.getElementById('btn-zoom-out')?.addEventListener('click', () => this.applyZoom(1, 2.0));
-    this.setupPinchZoom();
   }
 
   spawnPlayer(id, role, position = null, playerNames = null) {
@@ -190,31 +204,8 @@ export class Game {
     this.updateHUD();
   }
 
-  applyZoom(dir, amount) {
-    if (!this.isRunning) return;
-    this.cameraOffset.y += dir * amount;
-    this.cameraOffset.z += dir * amount * 0.8;
-    this.cameraOffset.y = Math.max(8, Math.min(30, this.cameraOffset.y));
-    this.cameraOffset.z = Math.max(6, Math.min(24, this.cameraOffset.z));
-  }
-
-  setupPinchZoom() {
-    let initialDist = 0;
-    this.container.addEventListener('touchstart', (e) => {
-      if (e.touches.length === 2) {
-        initialDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
-      }
-    }, { passive: true });
-    this.container.addEventListener('touchmove', (e) => {
-      if (e.touches.length === 2) {
-        const dist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
-        if (initialDist > 0) {
-          const delta = initialDist - dist;
-          if (Math.abs(delta) > 5) { this.applyZoom(delta > 0 ? 1 : -1, 0.5); initialDist = dist; }
-        }
-      }
-    }, { passive: true });
-  }
+  applyZoom(dir, amount) {}
+  setupPinchZoom() {}
 
   stop() {
     this.isRunning = false;
@@ -222,11 +213,11 @@ export class Game {
     this.audio.stopAll();
     this.players.forEach((p) => p.destroy());
     this.players.clear();
-    // Bug #21 fix: remove the wheel zoom listener to prevent accumulation across sessions
-    if (this._wheelHandler) {
-      window.removeEventListener('wheel', this._wheelHandler);
-      this._wheelHandler = null;
+    
+    if (document.pointerLockElement === this.renderer.domElement) {
+      document.exitPointerLock();
     }
+    
     this.container.innerHTML = '';
   }
 
@@ -742,7 +733,9 @@ export class Game {
       document.getElementById('slot-shield')?.style.setProperty('--cooldown-pct', `${100 - shieldPct}%`);
 
       // Update local player with client-side prediction
-      const { move, action } = localPlayer.updateLocal(dt, this.input, this.world, this.activePowerups, this.world.flatColliders, this.network._inputSeq);
+      const { move, action } = localPlayer.updateLocal(
+        dt, this.input, this.world, this.activePowerups, this.world.flatColliders, this.network._inputSeq, this.cameraYaw
+      );
 
       // Send input to server at ~30Hz
       if (performance.now() - this._lastInputSend > 33) {
@@ -756,10 +749,19 @@ export class Game {
       if (this.activePowerups.shield > 0) this.activePowerups.shield -= dt;
       if (this.activePowerups.aura > 0) this.activePowerups.aura -= dt;
 
-      // Camera follow
-      const targetCamPos = localPlayer.group.position.clone().add(this.cameraOffset);
-      this.camera.position.lerp(targetCamPos, 5 * dt);
-      this.camera.lookAt(localPlayer.group.position);
+      // Camera follow (3rd person orbit)
+      const offset = new THREE.Vector3(
+        Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
+        Math.sin(this.cameraPitch) * this.cameraDistance,
+        Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
+      );
+      
+      const targetCamPos = localPlayer.group.position.clone().add(offset);
+      // Smoothly move camera
+      this.camera.position.lerp(targetCamPos, 15 * dt);
+      
+      const lookAtTarget = localPlayer.group.position.clone().add(new THREE.Vector3(0, 1.2, 0));
+      this.camera.lookAt(lookAtTarget);
 
     } else if (spectating) {
       const alive = Array.from(this.players.values()).filter(p => !p.isDead && !p.isExtracted);
@@ -771,9 +773,17 @@ export class Game {
           this._spectateLock = false;
         }
         const target = alive[this.spectateIndex % alive.length];
-        const targetCamPos = target.group.position.clone().add(this.cameraOffset);
-        this.camera.position.lerp(targetCamPos, 3 * dt);
-        this.camera.lookAt(target.group.position);
+        
+        const offset = new THREE.Vector3(
+          Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
+          Math.sin(this.cameraPitch) * this.cameraDistance,
+          Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
+        );
+        
+        const targetCamPos = target.group.position.clone().add(offset);
+        this.camera.position.lerp(targetCamPos, 10 * dt);
+        const lookAtTarget = target.group.position.clone().add(new THREE.Vector3(0, 1.2, 0));
+        this.camera.lookAt(lookAtTarget);
       }
     }
 
