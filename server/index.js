@@ -496,6 +496,11 @@ wss.on('connection', (ws) => {
           break;
         }
 
+        case 'client_ping': {
+          safeSend(ws, { type: 'client_pong' });
+          break;
+        }
+
         default: break;
       }
     } catch (e) {

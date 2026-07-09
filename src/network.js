@@ -44,6 +44,14 @@ export class NetworkManager {
     this.onPingUpdate = null;
 
     this.connectServer();
+
+    // Client-initiated ping for UI
+    this._pingInterval = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this._lastPingSent = performance.now();
+        this._send({ type: 'client_ping' });
+      }
+    }, 1000);
   }
 
   // ---------------------------------------------------------------------------
@@ -182,11 +190,13 @@ export class NetworkManager {
         break;
 
       case 'ping':
-        // Server pings us; we pong back immediately for RTT tracking
+        // Server pings us; we pong back immediately so server can track our RTT
         this._send({ type: 'pong', t: data.t });
-        // Also use the round-trip to compute our ping estimate
-        if (data.t) {
-          this.ping = Math.round(Date.now() - data.t);
+        break;
+
+      case 'client_pong':
+        if (this._lastPingSent) {
+          this.ping = Math.round(performance.now() - this._lastPingSent);
           if (this.onPingUpdate) this.onPingUpdate(null, this.ping);
         }
         break;

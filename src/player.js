@@ -212,7 +212,11 @@ export class Player {
     const dx = serverPos.x - this.group.position.x;
     const dz = serverPos.z - this.group.position.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
-    if (dist < 0.05) return; // close enough, skip
+    
+    // If we're within 1.5 meters of the server's last known position, trust our local 
+    // predicted movement. This prevents rubber-banding ("jamming") since the server 
+    // snapshot is always in the past due to RTT.
+    if (dist < 1.5) return;
 
     // Lerp-correct rather than snap to avoid rubber-banding flicker
     const alpha = Math.min(1, dist * 0.4); // stronger correction the further we are
