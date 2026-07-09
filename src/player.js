@@ -1,9 +1,12 @@
 import * as THREE from 'three';
+import { predictTick } from './predict.js';
+import { BASE_SPEED_SURV, BASE_SPEED_ZOMBIE, POWERUP_SPEED_MULT, TICK_MS } from './constants.js';
 
-// Remote players are rendered INTERP_DELAY_TICKS behind the latest
-// server tick to smooth over packet-arrival jitter.
-// At 20Hz (50ms/tick) this is 100ms — same as before but now tick-based.
-const INTERP_DELAY_TICKS = 2;
+// Default interpolation delay for remote players.
+// The Game increases this adaptively based on measured arrival jitter.
+const DEFAULT_INTERP_DELAY_TICKS = 4;  // 200ms at 20Hz
+const MAX_EXTRAPOLATE_TICKS = 3;        // dead-reckoning cap when buffer empties
+const MAX_INPUT_BUFFER = 120;           // ~4s at 30Hz — covers any realistic RTT
 
 export class Player {
   constructor(id, role, scene, assets, displayName = null) {
@@ -21,12 +24,17 @@ export class Player {
     this.actions = {};
     this.currentAction = '';
 
-    this.speed = this.role === 'zombie' ? 5.5 : 5.0;
+    this.speed = this.role === 'zombie' ? BASE_SPEED_ZOMBIE : BASE_SPEED_SURV;
 
     // Snapshot buffer for remote interpolation: [{ tick, pos, rot, anim, powerups }]
     // Sorted by tick ascending. New snapshots are insert-sorted; stale ones dropped.
     this.snapshots = [];
     this._lastAppliedTick = -1;
+    this._interpDelayTicks = DEFAULT_INTERP_DELAY_TICKS;
+
+    // Arrival jitter tracking (ring buffer of 10 inter-arrival deltas in ms)
+    this._arrivalTimes = [];
+    this._lastArrivalTime = null;
 
     this.targetPos = new THREE.Vector3();
     this.targetRot = 0;
@@ -40,6 +48,15 @@ export class Player {
     this.onAttack = null;
 
     this.nameTagSprite = null;
+
+    // --- Client-side prediction state (local player only) ---
+    // Input history buffer: [{ seq, move, action, dt, speedAtTime }]
+    // Used to replay inputs after server reconciliation.
+    this._inputBuffer = [];
+    // Last reconciliation error (metres) — exposed for debug overlay.
+    this._predictionError = 0;
+    // Smooth correction vector applied over ~10 frames after small drift.
+    this._correction = new THREE.Vector3();
 
     // Visual Effects
     this.shieldGeo = new THREE.TorusGeometry(1.2, 0.1, 8, 24);
@@ -139,14 +156,37 @@ export class Player {
 
   // ---- Local player update (client-side prediction) ----
   // Returns { move, action } for sending to server as input message.
-  updateLocal(dt, input, world, activePowerups = null) {
+  /**
+   * Update local player every frame.
+   *
+   * NOW USES predictTick() — identical collision math to the server — so the
+   * input buffer can be replayed after reconciliation without diverging.
+   *
+   * @param {number}   dt              frame delta (seconds)
+   * @param {object}   input           Input manager
+   * @param {object}   world           World instance (used only for checkCollision
+   *                                    on the Three.js side for the HUD overlay;
+   *                                    prediction uses world.flatColliders)
+   * @param {object}   activePowerups  local copy of powerup timers { speed, shield, aura }
+   * @param {Array}    flatColliders   world.flatColliders — flat format for predict.js
+   * @param {number}   seq             current input sequence number (from network)
+   * @returns {{ move, action }}
+   */
+  updateLocal(dt, input, world, activePowerups, flatColliders, seq) {
     if (activePowerups) {
-      this.activePowerups.speed = activePowerups.speed > 0;
+      this.activePowerups.speed  = activePowerups.speed  > 0;
       this.activePowerups.shield = activePowerups.shield > 0;
-      this.activePowerups.aura = activePowerups.aura > 0;
+      this.activePowerups.aura   = activePowerups.aura   > 0;
     }
 
     this.updateVisualEffects(dt);
+
+    // Apply any pending smooth correction (from small reconciliation drifts)
+    if (this._correction.lengthSq() > 0.0001) {
+      const step = this._correction.clone().multiplyScalar(Math.min(1, 10 * dt));
+      this.group.position.add(step);
+      this._correction.sub(step);
+    }
 
     if (this.isDead || this.isExtracted) {
       this.mixer?.update(dt);
@@ -159,23 +199,25 @@ export class Player {
     const move = input.getMovement();
 
     if (move.x !== 0 || move.y !== 0) {
-      const moveVec = new THREE.Vector3(move.x, 0, move.y).normalize();
-      const targetAngle = Math.atan2(moveVec.x, moveVec.z);
-      let diff = targetAngle - this.group.rotation.y;
-      while (diff < -Math.PI) diff += Math.PI * 2;
-      while (diff > Math.PI) diff -= Math.PI * 2;
-      this.group.rotation.y += diff * 10 * dt;
+      // Speed mirrors server gameTick() exactly
+      const baseSpeed = this.role === 'zombie' ? BASE_SPEED_ZOMBIE : BASE_SPEED_SURV;
+      const speed = activePowerups?.speed > 0 ? baseSpeed * POWERUP_SPEED_MULT : baseSpeed;
 
-      const step = moveVec.multiplyScalar(this.speed * dt);
-      const newPos = this.group.position.clone().add(step);
-
-      if (!world.checkCollision(newPos, 0.5)) {
-        this.group.position.copy(newPos);
-      } else {
-        const posX = this.group.position.clone(); posX.x += step.x;
-        const posZ = this.group.position.clone(); posZ.z += step.z;
-        if (!world.checkCollision(posX, 0.5)) this.group.position.copy(posX);
-        else if (!world.checkCollision(posZ, 0.5)) this.group.position.copy(posZ);
+      // Use predictTick() — same applyMoveFlat math as the server — instead of
+      // the old Three.js-based movement so prediction stays in sync.
+      const result = predictTick(
+        this.group.position.x,
+        this.group.position.z,
+        move, speed, dt, flatColliders
+      );
+      this.group.position.x = result.x;
+      this.group.position.z = result.z;
+      if (result.rotY !== null) {
+        // Smooth rotation (same slerp as before)
+        let diff = result.rotY - this.group.rotation.y;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        while (diff > Math.PI)  diff -= Math.PI * 2;
+        this.group.rotation.y += diff * 10 * dt;
       }
 
       animToPlay = 'sprint';
@@ -188,12 +230,24 @@ export class Player {
       this._footstepTimer = 0;
     }
 
+    // Store this frame's input in the history buffer for reconciliation replay.
+    if (flatColliders && seq !== undefined) {
+      const baseSpeed = this.role === 'zombie' ? BASE_SPEED_ZOMBIE : BASE_SPEED_SURV;
+      this._inputBuffer.push({
+        seq,
+        move: { x: move.x, y: move.y },
+        action: input.isActionPressed(),
+        dt,
+        speed: activePowerups?.speed > 0 ? baseSpeed * POWERUP_SPEED_MULT : baseSpeed,
+      });
+      if (this._inputBuffer.length > MAX_INPUT_BUFFER) this._inputBuffer.shift();
+    }
+
     const action = input.isActionPressed();
     if (action && this.actionCooldown <= 0 && this.role === 'zombie') {
       animToPlay = 'attack-melee-right';
       this.actionCooldown = 1.0;
       this.onAttack?.(this);
-      // NOTE: Server decides the actual hit — we just play the animation and send input
     }
 
     if (this.actionCooldown > 0 && this.currentAction === 'attack-melee-right') {
@@ -206,34 +260,90 @@ export class Player {
     return { move, action };
   }
 
-  // ---- Server reconciliation (called when a snapshot arrives for the local player) ----
-  // serverPos is the authoritative position the server recorded for us at serverTick.
-  reconcile(serverPos, serverTick) {
+  /**
+   * Server reconciliation — called in handleSnapshot() for the local player.
+   *
+   * Three-threshold strategy:
+   *   < 0.05m  → floating-point noise, ignore
+   *   < 0.5m   → small drift — apply smooth correction over ~10 frames (no replay needed)
+   *   ≥ 0.5m   → hard mismatch — snap to server pos, replay buffered inputs
+   *
+   * @param {{ x, z }} serverPos   authoritative position from snapshot
+   * @param {number}   confirmedSeq  last input seq the server processed (state.seq)
+   * @param {Array}    flatColliders world.flatColliders for replaying inputs
+   */
+  reconcile(serverPos, confirmedSeq, flatColliders) {
     const dx = serverPos.x - this.group.position.x;
     const dz = serverPos.z - this.group.position.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
-    
-    // If we're within 1.5 meters of the server's last known position, trust our local 
-    // predicted movement. This prevents rubber-banding ("jamming") since the server 
-    // snapshot is always in the past due to RTT.
-    if (dist < 1.5) return;
+    this._predictionError = dist; // expose for debug overlay
 
-    // Lerp-correct rather than snap to avoid rubber-banding flicker
-    const alpha = Math.min(1, dist * 0.4); // stronger correction the further we are
-    this.group.position.x += (serverPos.x - this.group.position.x) * alpha;
-    this.group.position.z += (serverPos.z - this.group.position.z) * alpha;
+    if (dist < 0.05) return; // floating-point noise — skip
+
+    if (dist < 0.5) {
+      // Small drift: accumulate into smooth correction vector instead of snapping.
+      // _correction is applied gradually in updateLocal() each frame.
+      this._correction.x += dx;
+      this._correction.z += dz;
+      return;
+    }
+
+    // Hard mismatch: snap to server authoritative position
+    this.group.position.x = serverPos.x;
+    this.group.position.z = serverPos.z;
+    this._correction.set(0, 0, 0);
+
+    // Replay all unacknowledged inputs (those after confirmedSeq)
+    if (flatColliders && confirmedSeq !== undefined) {
+      // Discard inputs the server has already processed
+      const startIdx = this._inputBuffer.findIndex(e => e.seq > confirmedSeq);
+      if (startIdx === -1) return; // nothing to replay
+
+      let rx = serverPos.x;
+      let rz = serverPos.z;
+      for (let i = startIdx; i < this._inputBuffer.length; i++) {
+        const entry = this._inputBuffer[i];
+        const result = predictTick(rx, rz, entry.move, entry.speed, entry.dt, flatColliders);
+        rx = result.x;
+        rz = result.z;
+      }
+      this.group.position.x = rx;
+      this.group.position.z = rz;
+    }
+  }
+
+  /** Allow Game to tune interp delay based on measured network jitter. */
+  setInterpDelay(ticks) {
+    this._interpDelayTicks = Math.max(2, Math.min(8, Math.round(ticks)));
+  }
+
+  /** Returns rolling jitter stddev in ms (for adaptive interp delay). */
+  getJitter() {
+    if (this._arrivalTimes.length < 2) return 0;
+    const mean = this._arrivalTimes.reduce((a, b) => a + b, 0) / this._arrivalTimes.length;
+    const variance = this._arrivalTimes.reduce((a, b) => a + (b - mean) ** 2, 0) / this._arrivalTimes.length;
+    return Math.sqrt(variance);
   }
 
   // ---- Remote player snapshot ingestion ----
-  // Insert-sorted by tick so out-of-order UDP packets don't corrupt the buffer.
+  // Insert-sorted by tick; tracks arrival jitter for adaptive interp delay.
   applyNetworkState(state) {
+    // Track arrival intervals for jitter measurement
+    const now = performance.now();
+    if (this._lastArrivalTime !== null) {
+      const interval = now - this._lastArrivalTime;
+      this._arrivalTimes.push(interval);
+      if (this._arrivalTimes.length > 10) this._arrivalTimes.shift();
+    }
+    this._lastArrivalTime = now;
+
     // Role change triggers infect animation
     if (state.role !== this.role && !this.isDead) {
       if (state.role === 'zombie') this.infect();
     }
 
     // Drop stale snapshots (older than our current render position)
-    if (state.tick <= this._lastAppliedTick - INTERP_DELAY_TICKS) return;
+    if (state.tick <= this._lastAppliedTick - this._interpDelayTicks) return;
 
     const entry = {
       tick: state.tick,
@@ -242,6 +352,19 @@ export class Player {
       anim: state.anim,
       powerups: state.powerups,
     };
+
+    if (this.snapshots.length > 0) {
+      const prevEntry = this.snapshots[this.snapshots.length - 1];
+      const tickDelta = entry.tick - prevEntry.tick;
+      if (tickDelta > 0) {
+        const dtSeconds = tickDelta * (TICK_MS / 1000);
+        entry.vel = new THREE.Vector3(
+          (entry.pos.x - prevEntry.pos.x) / dtSeconds,
+          0,
+          (entry.pos.z - prevEntry.pos.z) / dtSeconds
+        );
+      }
+    }
 
     // Insert-sort ascending by tick
     let inserted = false;
@@ -260,8 +383,8 @@ export class Player {
 
   // ---- Remote player interpolation (tick-based, no Date.now()) ----
   updateRemote(dt, currentServerTick) {
-    // The tick we want to render: server's current tick minus delay
-    const renderTick = currentServerTick - INTERP_DELAY_TICKS;
+    // The tick we want to render: server's current tick minus adaptive delay
+    const renderTick = currentServerTick - this._interpDelayTicks;
 
     // Drop snapshots that are now behind the render window
     while (this.snapshots.length > 2 && this.snapshots[1].tick <= renderTick) {
@@ -279,7 +402,7 @@ export class Player {
 
       let diff = b.rot - a.rot;
       while (diff < -Math.PI) diff += Math.PI * 2;
-      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff > Math.PI)  diff -= Math.PI * 2;
       this.targetRot = a.rot + diff * alpha;
 
       if (!this.isDead && b.anim) {
@@ -290,7 +413,21 @@ export class Player {
       this.group.rotation.y = this.targetRot;
 
     } else if (this.snapshots.length === 1) {
-      this.group.position.lerp(this.snapshots[0].pos, 10 * dt);
+      // Dead-reckoning: extrapolate from the last known state using estimated velocity.
+      // This smooths over brief buffer starvation instead of freezing the character.
+      const snap = this.snapshots[0];
+      const ticksAhead = Math.min(currentServerTick - snap.tick, MAX_EXTRAPOLATE_TICKS);
+      if (ticksAhead > 0 && snap.vel) {
+        // vel was stored when there were 2 snapshots to diff
+        const t = ticksAhead * (TICK_MS / 1000);
+        this.group.position.set(
+          snap.pos.x + snap.vel.x * t,
+          snap.pos.y,
+          snap.pos.z + snap.vel.z * t
+        );
+      } else {
+        this.group.position.lerp(snap.pos, 10 * dt);
+      }
     }
 
     this.mixer?.update(dt);

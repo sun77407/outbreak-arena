@@ -57,7 +57,10 @@ export class Game {
 
     // Server tick tracking for interpolation
     this.serverTick = 0;
+    this._predictedTick = 0;
     this._lastInputSend = 0;
+    this._debugOverlay = false;
+    this._lastAdaptiveUpdate = 0;
 
     // Network callbacks
     this.network.onSnapshot = this.handleSnapshot.bind(this);
@@ -88,6 +91,14 @@ export class Game {
         this.chatInputEl.blur();
       } else if (e.key === 'Escape') {
         this.chatInputEl.blur();
+      }
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === '`') {
+        this._debugOverlay = !this._debugOverlay;
+        const el = document.getElementById('debug-overlay');
+        if (el) el.style.display = this._debugOverlay ? 'block' : 'none';
       }
     });
 
@@ -267,7 +278,8 @@ export class Game {
 
       if (state.id === this.localPlayerId) {
         // Reconcile local prediction with server position
-        player.reconcile({ x: state.x, z: state.z }, state.tick);
+        player.reconcile({ x: state.x, z: state.z }, state.seq, this.world.flatColliders);
+        this._predictedTick = this.serverTick;
         // Update role if server says we changed
         if (state.role !== player.role && !player.isDead) {
           if (state.role === 'zombie') player.infect();
@@ -730,7 +742,7 @@ export class Game {
       document.getElementById('slot-shield')?.style.setProperty('--cooldown-pct', `${100 - shieldPct}%`);
 
       // Update local player with client-side prediction
-      const { move, action } = localPlayer.updateLocal(dt, this.input, this.world, this.activePowerups);
+      const { move, action } = localPlayer.updateLocal(dt, this.input, this.world, this.activePowerups, this.world.flatColliders, this.network._inputSeq);
 
       // Send input to server at ~30Hz
       if (performance.now() - this._lastInputSend > 33) {
@@ -765,6 +777,22 @@ export class Game {
       }
     }
 
+    // Adaptive delay calculation once per second
+    if (performance.now() - this._lastAdaptiveUpdate > 1000) {
+      let maxJitter = 0;
+      this.players.forEach((p, id) => {
+        if (id !== this.localPlayerId) {
+          const j = p.getJitter();
+          if (j > maxJitter) maxJitter = j;
+        }
+      });
+      const adaptiveDelay = Math.max(2, Math.min(8, Math.ceil((50 + 1.5 * maxJitter) / 50)));
+      this.players.forEach((p, id) => {
+        if (id !== this.localPlayerId) p.setInterpDelay(adaptiveDelay);
+      });
+      this._lastAdaptiveUpdate = performance.now();
+    }
+
     // Update remote players using server tick
     this.players.forEach((p, id) => {
       if (id !== this.localPlayerId) p.updateRemote(dt, this.serverTick);
@@ -772,6 +800,29 @@ export class Game {
 
     this.updateProximityHeartbeat();
     this.drawMinimap();
+
+    // Debug Overlay Update
+    if (this._debugOverlay) {
+      const el = document.getElementById('debug-overlay');
+      if (el) {
+        let avgInterpBuf = 0;
+        let remoteCount = 0;
+        this.players.forEach((p, id) => {
+          if (id !== this.localPlayerId) {
+            avgInterpBuf += p.snapshots.length;
+            remoteCount++;
+          }
+        });
+        avgInterpBuf = remoteCount > 0 ? (avgInterpBuf / remoteCount).toFixed(1) : 0;
+        
+        el.innerHTML = `[NET DEBUG]<br>` +
+          `RTT:          ${this.network.ping}ms<br>` +
+          `Pred Δ:       ${localPlayer ? localPlayer._predictionError.toFixed(3) : 0}m<br>` +
+          `Interp buf:   ${avgInterpBuf} snaps<br>` +
+          `Server tick:  ${this.serverTick}<br>` +
+          `Pred tick:    ${this._predictedTick}`;
+      }
+    }
 
     // Timer display
     const now = Date.now();

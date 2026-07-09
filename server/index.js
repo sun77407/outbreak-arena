@@ -255,12 +255,14 @@ function gameTick(room) {
   const snapshot = {
     type: 'snapshot',
     tick: room.tick,
+    serverTime: Date.now(),   // wall-clock for client jitter measurement + debug overlay
     players: [],
   };
   for (const [, p] of room.players) {
     snapshot.players.push({
       id: p.id,
       tick: room.tick,   // Bug #3 fix: per-player tick needed for client interpolation
+      seq: p.inputSeq,   // echo last processed input seq so client can match prediction frames
       x: p.x, z: p.z, rotY: p.rotY,
       role: p.role,
       isDead: p.isDead,
@@ -368,6 +370,10 @@ function closeRoom(code, reason) {
 // WebSocket connection handler
 // ---------------------------------------------------------------------------
 wss.on('connection', (ws) => {
+  // Disable Nagle's algorithm: each snapshot/event gets its own TCP segment immediately
+  // instead of being buffered for up to 200ms. Zero risk, meaningful jitter reduction.
+  ws._socket.setNoDelay(true);
+
   // Bug #2 fix: use cryptographically-secure server-generated ID (16 hex chars)
   ws.playerId = crypto.randomBytes(8).toString('hex');
   ws.roomCode = null;

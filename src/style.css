@@ -721,3 +721,21 @@ input[type=range] {
   #joystick-zone { width: 42%; height: 42%; bottom: 0; left: 0; }
   .top-hud { padding: 0.5rem; }
 }
+
+/* Debug Overlay */
+#debug-overlay {
+  position: absolute;
+  bottom: 1rem;
+  left: 1rem;
+  background: rgba(0, 0, 0, 0.75);
+  color: #10b981;
+  font-family: monospace;
+  font-size: 0.85rem;
+  padding: 0.8rem;
+  border-radius: 8px;
+  border: 1px solid rgba(16, 185, 129, 0.3);
+  pointer-events: none;
+  z-index: 999;
+  white-space: pre;
+  line-height: 1.4;
+}

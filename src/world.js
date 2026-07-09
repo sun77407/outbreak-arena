@@ -2,7 +2,8 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
 
-const ARENA_HALF = 25;
+import { ARENA_HALF } from './constants.js';
+// Note: ARENA_HALF re-exported from constants so world.js internal references still work
 
 // ---------------------------------------------------------------------------
 // Seeded PRNG — mulberry32.
@@ -30,7 +31,8 @@ function makePRNG(seed) {
 export class World {
   constructor(scene) {
     this.scene = scene;
-    this.colliders = []; // { type:'sphere', center:Vector3, radius } or { type:'box', cx,cz,hw,hd }
+    this.colliders = [];     // Three.js format: { type:'sphere', center:Vector3, radius } or { type:'box', cx,cz,hw,hd }
+    this.flatColliders = []; // Flat-number format for predict.js: { type:'sphere'|'box', cx, cz, r, hw, hd }
     this.safeZone = { center: new THREE.Vector3(0, 0, -15), radius: 3 };
     this.loader = new GLTFLoader();
     this.assets = {
@@ -129,7 +131,9 @@ export class World {
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       this.scene.add(mesh);
-      this.colliders.push({ type: 'box', cx, cz, hw: w / 2, hd: d / 2 });
+      const hw = w / 2, hd = d / 2;
+      this.colliders.push({ type: 'box', cx, cz, hw, hd });
+      this.flatColliders.push({ type: 'box', cx, cz, hw, hd }); // prediction mirror
       this.mapProps.push({ x: cx, z: cz, isWall: true, w, d });
     };
 
@@ -149,9 +153,10 @@ export class World {
    */
   scatterObstacles(sources, count, seed) {
     const rng = makePRNG(seed);
+    const cosmeticRng = makePRNG(seed + '_model');
 
     for (let i = 0; i < count; i++) {
-      const srcIdx = Math.floor(rng() * sources.length);
+      const srcIdx = Math.floor(cosmeticRng() * sources.length);
       const source = sources[srcIdx];
       const model = SkeletonUtils.clone(source);
 
@@ -162,8 +167,7 @@ export class World {
 
       if (Math.abs(x) < 5 && Math.abs(z) < 5) continue;
 
-      // Skip if it would overlap a maze wall (simple AABB vs point check)
-      if (this._overlapsWall(x, z)) continue;
+
 
       model.position.set(x, 0, z);
       model.rotation.y = rotY;
@@ -182,22 +186,12 @@ export class World {
         center: new THREE.Vector3(x, 0, z),
         radius: 0.5 * scaleJitter,
       });
+      // Flat mirror for predict.js (identical math to server/world-server.js buildColliders)
+      this.flatColliders.push({ type: 'sphere', cx: x, cz: z, r: 0.5 * scaleJitter });
     }
   }
 
-  /** Quick check: would placing an obstacle at (x,z) block a maze wall passage? */
-  _overlapsWall(x, z) {
-    const WALL_SAFE = 1.5;
-    const walls = [
-      { cx: 10, cz: 10, hw: 6, hd: 0.5 }, { cx: -10, cz: 10, hw: 6, hd: 0.5 },
-      { cx: 10, cz: -10, hw: 0.5, hd: 6 }, { cx: -10, cz: -10, hw: 0.5, hd: 6 },
-      { cx: 0, cz: 15, hw: 4, hd: 0.5 }, { cx: 0, cz: -15, hw: 4, hd: 0.5 },
-    ];
-    for (const w of walls) {
-      if (Math.abs(x - w.cx) < w.hw + WALL_SAFE && Math.abs(z - w.cz) < w.hd + WALL_SAFE) return true;
-    }
-    return false;
-  }
+
 
   buildBoundaryWalls() {
     const fenceMat = new THREE.MeshStandardMaterial({ color: 0x334455, roughness: 0.6, metalness: 0.4, transparent: true, opacity: 0.85 });
