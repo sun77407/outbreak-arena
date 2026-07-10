@@ -170,6 +170,10 @@ export class NetworkManager {
         if (this.onSnapshot) this.onSnapshot(data);
         break;
 
+      case 'all_ready':
+        if (this.onAllReady) this.onAllReady(data);
+        break;
+
       // Reliable game events — route through onServerEvent
       case 'infect_event':
       case 'role_changed':
@@ -233,10 +237,8 @@ export class NetworkManager {
    * Send player input to server (replaces sendData / position broadcast).
    * Called every frame (throttled by game.js to ~30Hz).
    */
-  sendInput(move, action) {
-    this._inputSeq++;
-    this._send({ type: 'input', seq: this._inputSeq, move, action: !!action });
-    return this._inputSeq;
+  sendInputBatch(inputs) {
+    this._send({ type: 'input_batch', inputs });
   }
 
   /**

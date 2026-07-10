@@ -71,8 +71,8 @@ function buildColliders(seed) {
 
     if (Math.abs(x) < 5 && Math.abs(z) < 5) continue; // same skip as client
 
-    // Larger radius so visual model matches physics (was 0.25 * scaleJitter on client — fixed)
-    colliders.push({ type: 'sphere', cx: x, cz: z, r: 0.5 * scaleJitter });
+    // Tighter radius (0.25) so players can slip between trees without getting stuck
+    colliders.push({ type: 'sphere', cx: x, cz: z, r: 0.25 * scaleJitter });
   }
 
   return colliders;

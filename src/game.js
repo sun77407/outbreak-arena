@@ -27,8 +27,8 @@ export class Game {
 
     this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
     this.cameraYaw = Math.PI; // Face "forward"
-    this.cameraPitch = Math.PI / 8; // Look slightly down
-    this.cameraDistance = 6;
+    this.cameraPitch = Math.PI / 16; // Look slightly down, fixed for shoulder view
+    this.cameraDistance = 5;
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -74,6 +74,9 @@ export class Game {
     this.input.onPause = () => this.togglePause();
     this.input.onMuteToggle = () => this.toggleMute();
     this.input.onChatFocus = () => this.chatInputEl?.focus();
+    this.input.onPowerup1 = () => this.usePowerup('speed');
+    this.input.onPowerup2 = () => this.usePowerup('shield');
+    this.input.onPowerup3 = () => this.usePowerup('trap');
 
     window.addEventListener('resize', this.onWindowResize.bind(this));
 
@@ -114,12 +117,7 @@ export class Game {
     document.addEventListener('mousemove', (e) => {
       if (document.pointerLockElement === this.renderer.domElement) {
         this.cameraYaw -= e.movementX * 0.002;
-        this.cameraPitch -= e.movementY * 0.002;
-        
-        // Clamp pitch to avoid flipping over
-        const maxPitch = Math.PI / 2 - 0.1;
-        const minPitch = -Math.PI / 4;
-        this.cameraPitch = Math.max(minPitch, Math.min(maxPitch, this.cameraPitch));
+        // Pitch is locked for shoulder-level view
       }
     });
 
@@ -134,10 +132,25 @@ export class Game {
   async start(initialState, onProgress) {
     const seed = initialState.seed || initialState.code || 'DEFAULT';
     await this.world.init(onProgress, seed);
+    
+    this.network.onAllReady = (data) => this.completeStart(initialState, data);
+    
+    const banner = document.createElement('div');
+    banner.id = 'wait-ready-banner';
+    banner.className = 'spectator-banner';
+    banner.textContent = 'Waiting for other players to load...';
+    const uiLayer = document.getElementById('ui-layer');
+    if (uiLayer) uiLayer.appendChild(banner);
+    
+    this.network._send({ type: 'player_ready' });
+  }
 
-    this.startTime = initialState.startTime;
-    const roundMs = (initialState.roundTime || 180) * 1000;
-    this.roundEndTime = initialState.startTime + roundMs + 2000;
+  completeStart(initialState, readyData) {
+    const banner = document.getElementById('wait-ready-banner');
+    if (banner) banner.remove();
+
+    this.startTime = readyData.startTime;
+    this.roundEndTime = readyData.roundEndTime;
 
     // Spawn all players
     const positions = initialState.positions || [];
@@ -732,14 +745,21 @@ export class Game {
       document.getElementById('slot-speed')?.style.setProperty('--cooldown-pct', `${100 - speedPct}%`);
       document.getElementById('slot-shield')?.style.setProperty('--cooldown-pct', `${100 - shieldPct}%`);
 
+      this.network._inputSeq++;
+      const currentSeq = this.network._inputSeq;
       // Update local player with client-side prediction
       const { move, action } = localPlayer.updateLocal(
-        dt, this.input, this.world, this.activePowerups, this.world.flatColliders, this.network._inputSeq, this.cameraYaw
+        dt, this.input, this.world, this.activePowerups, this.world.flatColliders, currentSeq, this.cameraYaw
       );
+
+      // Queue input for batching
+      if (!this._pendingInputs) this._pendingInputs = [];
+      this._pendingInputs.push({ seq: currentSeq, move, action, dt });
 
       // Send input to server at ~30Hz
       if (performance.now() - this._lastInputSend > 33) {
-        this.network.sendInput(move, action);
+        this.network.sendInputBatch(this._pendingInputs);
+        this._pendingInputs = [];
         this._lastInputSend = performance.now();
       }
 
@@ -749,12 +769,15 @@ export class Game {
       if (this.activePowerups.shield > 0) this.activePowerups.shield -= dt;
       if (this.activePowerups.aura > 0) this.activePowerups.aura -= dt;
 
-      // Camera follow (3rd person orbit)
+      // Camera follow (3rd person orbit with shoulder offset)
       const offset = new THREE.Vector3(
         Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
         Math.sin(this.cameraPitch) * this.cameraDistance,
         Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
       );
+      // Shoulder offset: push right relative to yaw
+      const rightVec = new THREE.Vector3(Math.cos(this.cameraYaw), 0, -Math.sin(this.cameraYaw));
+      offset.add(rightVec.multiplyScalar(1.2));
       
       const targetCamPos = localPlayer.group.position.clone().add(offset);
       // Smoothly move camera
@@ -779,6 +802,8 @@ export class Game {
           Math.sin(this.cameraPitch) * this.cameraDistance,
           Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
         );
+        const rightVec = new THREE.Vector3(Math.cos(this.cameraYaw), 0, -Math.sin(this.cameraYaw));
+        offset.add(rightVec.multiplyScalar(1.2));
         
         const targetCamPos = target.group.position.clone().add(offset);
         this.camera.position.lerp(targetCamPos, 10 * dt);

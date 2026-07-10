@@ -9,6 +9,9 @@ export class InputManager {
     this.onPause = null;   // Escape
     this.onMuteToggle = null; // M
     this.onChatFocus = null; // Enter
+    this.onPowerup1 = null; // 1
+    this.onPowerup2 = null; // 2
+    this.onPowerup3 = null; // 3
 
     this.initKeyboard();
     this.initJoystick();
@@ -35,6 +38,9 @@ export class InputManager {
       if (e.code === 'Escape' && this.onPause) this.onPause();
       if ((e.key === 'm' || e.key === 'M') && this.onMuteToggle) this.onMuteToggle();
       if (e.key === 'Enter' && this.onChatFocus) this.onChatFocus();
+      if (e.key === '1' && this.onPowerup1) this.onPowerup1();
+      if (e.key === '2' && this.onPowerup2) this.onPowerup2();
+      if (e.key === '3' && this.onPowerup3) this.onPowerup3();
     });
 
     window.addEventListener('keyup', (e) => {

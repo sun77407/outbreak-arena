@@ -19,7 +19,7 @@ app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 // Constants
 // ---------------------------------------------------------------------------
 const MAX_PLAYERS = 6;
-const TICK_MS = 50;            // 20 Hz
+const TICK_MS = 16.666;        // ~60 Hz
 const HISTORY_TICKS = 6;       // ~300 ms of position history for lag comp
 const PLAYER_RADIUS = 0.5;
 const INFECT_RADIUS = 2.2;
@@ -113,6 +113,7 @@ function makePlayer(id, name, ws, role = 'survivor') {
     speed: role === 'zombie' ? 5.5 : 5.0,
     inputMove: { x: 0, y: 0 },
     inputAction: false, inputSeq: 0,
+    inputQueue: [],
     actionCooldown: 0,
     history: [],
     ping: 0, lastPingAt: 0,
@@ -159,21 +160,37 @@ function gameTick(room) {
   // --- 1. Apply inputs → move players ---
   for (const [, p] of room.players) {
     if (p.isDead || p.isExtracted) continue;
-    if (p.actionCooldown > 0) p.actionCooldown -= dt;
-
-    const baseSpeed = p.role === 'zombie' ? 5.5 : 5.0;
-    p.speed = p.activePowerups.speed > 0 ? baseSpeed * 1.5 : baseSpeed;
-
-    const { x: mx, y: my } = p.inputMove;
-    if (mx !== 0 || my !== 0) {
-      const len = Math.sqrt(mx * mx + my * my);
-      const nx = mx / len, ny = my / len;
-      const dx = nx * p.speed * dt;
-      const dz = ny * p.speed * dt;
-      const moved = applyMove(p.x, p.z, dx, dz, PLAYER_RADIUS, room.colliders);
-      p.x = moved.x;
-      p.z = moved.z;
-      p.rotY = Math.atan2(nx, ny);
+    // Process queued inputs
+    if (p.inputQueue && p.inputQueue.length > 0) {
+      p.inputQueue.sort((a, b) => a.seq - b.seq);
+      for (const input of p.inputQueue) {
+        if (input.seq <= p.inputSeq) continue;
+        
+        const idt = input.dt || TICK_MS / 1000;
+        if (p.actionCooldown > 0) p.actionCooldown -= idt;
+        
+        const baseSpeed = p.role === 'zombie' ? 5.5 : 5.0;
+        p.speed = p.activePowerups.speed > 0 ? baseSpeed * 1.5 : baseSpeed;
+        
+        const { x: mx, y: my } = input.move;
+        if (mx !== 0 || my !== 0) {
+          const len = Math.sqrt(mx * mx + my * my);
+          const nx = mx / len, ny = my / len;
+          const dx = nx * p.speed * idt;
+          const dz = ny * p.speed * idt;
+          const moved = applyMove(p.x, p.z, dx, dz, PLAYER_RADIUS, room.colliders);
+          p.x = moved.x;
+          p.z = moved.z;
+          p.rotY = Math.atan2(nx, ny);
+        }
+        
+        p.inputMove = input.move;
+        p.inputAction = input.action;
+        p.inputSeq = input.seq;
+      }
+      p.inputQueue = [];
+    } else {
+      if (p.actionCooldown > 0) p.actionCooldown -= TICK_MS / 1000;
     }
 
     // Record history for lag comp
@@ -252,30 +269,32 @@ function gameTick(room) {
   }
 
   // --- 6. Build and broadcast snapshot ---
-  const snapshot = {
-    type: 'snapshot',
-    tick: room.tick,
-    serverTime: Date.now(),   // wall-clock for client jitter measurement + debug overlay
-    players: [],
-  };
-  for (const [, p] of room.players) {
-    snapshot.players.push({
-      id: p.id,
-      tick: room.tick,   // Bug #3 fix: per-player tick needed for client interpolation
-      seq: p.inputSeq,   // echo last processed input seq so client can match prediction frames
-      x: p.x, z: p.z, rotY: p.rotY,
-      role: p.role,
-      isDead: p.isDead,
-      isExtracted: p.isExtracted,
-      anim: resolveAnim(p),
-      powerups: {
-        speed: p.activePowerups.speed > 0,
-        shield: p.activePowerups.shield > 0,
-        aura: p.activePowerups.aura > 0,
-      },
-    });
+  if (room.tick % 3 === 0) {
+    const snapshot = {
+      type: 'snapshot',
+      tick: room.tick,
+      serverTime: Date.now(),   // wall-clock for client jitter measurement + debug overlay
+      players: [],
+    };
+    for (const [, p] of room.players) {
+      snapshot.players.push({
+        id: p.id,
+        tick: room.tick,   // Bug #3 fix: per-player tick needed for client interpolation
+        seq: p.inputSeq,   // echo last processed input seq so client can match prediction frames
+        x: p.x, z: p.z, rotY: p.rotY,
+        role: p.role,
+        isDead: p.isDead,
+        isExtracted: p.isExtracted,
+        anim: resolveAnim(p),
+        powerups: {
+          speed: p.activePowerups.speed > 0,
+          shield: p.activePowerups.shield > 0,
+          aura: p.activePowerups.aura > 0,
+        },
+      });
+    }
+    broadcast(room.clients, snapshot);
   }
-  broadcast(room.clients, snapshot);
 
   // --- 7. Check win conditions ---
   const remain = room.roundEndTime - Date.now();
@@ -460,17 +479,39 @@ wss.on('connection', (ws) => {
         }
 
         // ---- Gameplay ----
-        case 'input': {
+        case 'player_ready': {
+          const room = rooms.get(ws.roomCode);
+          if (!room || !room.gameRunning) return;
+          const p = room.players.get(ws.playerId);
+          if (p) p.isReady = true;
+
+          if (room.allPlayersReady) {
+            safeSend(ws, { type: 'all_ready', startTime: room.roundEndTime - room._roundMs - 2000, roundEndTime: room.roundEndTime });
+            return;
+          }
+
+          let allReady = true;
+          for (const [, rp] of room.players) {
+            if (!rp.isReady) { allReady = false; break; }
+          }
+          
+          if (allReady && !room.allPlayersReady) {
+            room.allPlayersReady = true;
+            room.roundEndTime = Date.now() + room._roundMs + 2000;
+            broadcast(room.clients, { type: 'all_ready', startTime: Date.now(), roundEndTime: room.roundEndTime });
+            room.gameLoopTimer = setInterval(() => gameTick(room), TICK_MS);
+          }
+          break;
+        }
+
+        case 'input_batch': {
           const room = rooms.get(ws.roomCode);
           if (!room || !room.gameRunning) return;
           const p = room.players.get(ws.playerId);
           if (!p || p.isDead || p.isExtracted) return;
-          if (data.move) {
-            p.inputMove.x = Math.max(-1, Math.min(1, data.move.x || 0));
-            p.inputMove.y = Math.max(-1, Math.min(1, data.move.y || 0));
+          if (data.inputs && Array.isArray(data.inputs)) {
+            p.inputQueue.push(...data.inputs);
           }
-          p.inputAction = !!data.action;
-          p.inputSeq = data.seq || 0;
           break;
         }
 
@@ -578,10 +619,10 @@ function startGame(room, roundTime, useSpinner) {
     p.inputAction = false;
   });
 
+  room.allPlayersReady = false;
   room.gameRunning = true;
   room.tick = 0;
   room._roundMs = roundTime * 1000;
-  room.roundEndTime = Date.now() + room._roundMs + 2000;
   room.powerups.clear();
   room.traps.clear();
   room.powerupTimer = 5;
@@ -596,8 +637,7 @@ function startGame(room, roundTime, useSpinner) {
     broadcast(room.clients, { type: 'ping', t: Date.now() });
   }, 2000);
 
-  // Start game loop
-  room.gameLoopTimer = setInterval(() => gameTick(room), TICK_MS);
+  // Delay starting game loop until all players send player_ready
   console.log(`Game started in room ${room.code}, zombie: ${zombieId}, seed: ${room.seed}`);
 }
 

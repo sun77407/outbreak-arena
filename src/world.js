@@ -180,14 +180,14 @@ export class World {
       this.scene.add(model);
       this.mapProps.push({ x, z });
 
-      // Larger radius (0.5) so visual model and physics match — was 0.25 before
+      // Tighter radius (0.25) so players can slip between trees without getting stuck
       this.colliders.push({
         type: 'sphere',
         center: new THREE.Vector3(x, 0, z),
-        radius: 0.5 * scaleJitter,
+        radius: 0.25 * scaleJitter,
       });
       // Flat mirror for predict.js (identical math to server/world-server.js buildColliders)
-      this.flatColliders.push({ type: 'sphere', cx: x, cz: z, r: 0.5 * scaleJitter });
+      this.flatColliders.push({ type: 'sphere', cx: x, cz: z, r: 0.25 * scaleJitter });
     }
   }
 

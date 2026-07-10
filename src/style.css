@@ -709,17 +709,23 @@ input[type=range] {
 #game-container canvas { display: block; width: 100%; height: 100%; outline: none; }
 
 /* Mobile tweaks */
-@media (max-width: 600px) {
+@media (max-width: 900px) and (orientation: landscape), (max-height: 600px) {
   .lobby-card { padding: 1.5rem 1rem; width: 95%; max-height: 95vh; overflow-y: auto; }
   .game-title { font-size: 2rem; }
-  /* Chat panel: left-aligned on small screens to avoid joystick zone overlap */
-  .chat-panel { width: 55vw; bottom: 1rem; left: 45%; transform: translateX(-50%); }
-  .minimap-wrap { width: 110px; height: 110px; top: 4rem; right: 0.75rem; }
-  /* Bug #10 fix: kill-feed below minimap on mobile too */
-  .kill-feed { max-width: 40vw; top: calc(4rem + 120px); right: 0.5rem; }
-  .action-buttons { bottom: 1rem; right: 1rem; transform: scale(0.85); transform-origin: bottom right; }
-  #joystick-zone { width: 42%; height: 42%; bottom: 0; left: 0; }
+  /* Chat panel: smaller and positioned to avoid joystick overlap */
+  .chat-panel { width: 35vw; bottom: 0.5rem; left: 50%; transform: translateX(-50%); }
+  .chat-log { max-height: 80px; font-size: 0.75rem; }
+  .chat-input { padding: 0.3rem 0.5rem; font-size: 0.75rem; }
+  .minimap-wrap { width: 110px; height: 110px; top: 3.5rem; right: 0.75rem; }
+  .kill-feed { max-width: 40vw; top: calc(3.5rem + 120px); right: 0.5rem; }
+  .kill-feed-item { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
+  .action-buttons { bottom: 0.5rem; right: 0.5rem; transform: scale(0.85); transform-origin: bottom right; }
+  #joystick-zone { width: 45%; height: 50%; bottom: 0; left: 0; }
   .top-hud { padding: 0.5rem; }
+  .timer { font-size: 1.5rem; }
+  .stats { padding: 0.3rem 0.6rem; gap: 0.8rem; font-size: 0.85rem; }
+  .stat.ping { font-size: 0.7rem; }
+  .icon-btn { width: 28px; height: 28px; font-size: 0.8rem; }
 }
 
 /* Debug Overlay */
