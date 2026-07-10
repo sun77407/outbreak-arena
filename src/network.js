@@ -6,11 +6,10 @@
  * Public API intentionally kept compatible with the old version
  * (same callback names) so main.js changes are minimal.
  */
-import geckos from '@geckos.io/client';
 
 export class NetworkManager {
   constructor() {
-    this.channel = null;
+    this.ws = null;
     this.roomCode = null;
     this.myId = Math.random().toString(36).substr(2, 9);
     this.myName = 'Survivor';
@@ -48,7 +47,7 @@ export class NetworkManager {
 
     // Client-initiated ping for UI
     this._pingInterval = setInterval(() => {
-      if (this.channel) {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
         this._lastPingSent = performance.now();
         this._send({ type: 'client_ping' });
       }
@@ -63,37 +62,31 @@ export class NetworkManager {
     if (port === 5173) {
       port = 3000; // Map Vite dev server to Node backend
     }
-    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+    const wsHost = port === 443 || port === 80 ? window.location.hostname : `${window.location.hostname}:${port}`;
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     if (this.onSignalingStatus) this.onSignalingStatus(this.reconnectAttempts ? 'reconnecting' : 'connecting');
 
-    this.channel = geckos({ 
-      url: `${protocol}//${window.location.hostname}`, 
-      port: port || (protocol === 'https:' ? 443 : 80)
-    });
+    this.ws = new WebSocket(`${protocol}//${wsHost}`);
 
-    this.channel.onConnect((error) => {
-      if (error) {
-        console.error(error.message);
-        if (!this._manualClose) this._tryReconnect();
-        return;
-      }
+    this.ws.onopen = () => {
       this.reconnectAttempts = 0;
       if (this.onSignalingStatus) this.onSignalingStatus('connected');
-      console.log('Connected to game server via Geckos WebRTC');
+      console.log('Connected to game server');
+    };
 
-      this.channel.on('msg', (data) => {
-        if (typeof data === 'string') {
-          try { data = JSON.parse(data); } catch { return; }
-        }
-        this._handleMessage(data);
-      });
-    });
+    this.ws.onmessage = (event) => {
+      let data;
+      try { data = JSON.parse(event.data); } catch { return; }
+      this._handleMessage(data);
+    };
 
-    this.channel.onDisconnect(() => {
+    this.ws.onclose = () => {
       console.log('Disconnected from game server');
       if (this._manualClose) return;
       this._tryReconnect();
-    });
+    };
+
+    this.ws.onerror = () => { /* onclose fires after */ };
   }
 
   _tryReconnect() {
@@ -225,8 +218,8 @@ export class NetworkManager {
   // Internal send helper
   // ---------------------------------------------------------------------------
   _send(data) {
-    if (this.channel) {
-      try { this.channel.emit('msg', data); } catch { /* ignore */ }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try { this.ws.send(JSON.stringify(data)); } catch { /* ignore */ }
     }
   }
 
@@ -278,7 +271,7 @@ export class NetworkManager {
 
   close() {
     this._manualClose = true;
-    if (this.channel) this.channel.close();
+    if (this.ws) this.ws.close();
   }
 
   // ---------------------------------------------------------------------------
