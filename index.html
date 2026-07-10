@@ -91,6 +91,7 @@
           <span class="stat survivor">🧍 <span id="count-survivor">0</span></span>
           <span class="stat zombie">🧟 <span id="count-zombie">0</span></span>
           <span class="stat ping" id="ping-value">--</span>
+          <button id="btn-settings" class="icon-btn" title="Settings (O)">⚙️</button>
           <button id="btn-mute" class="icon-btn" title="Mute (M)">🔊</button>
           <button id="btn-pause" class="icon-btn" title="Pause (Esc)">⏸</button>
         </div>
@@ -154,6 +155,39 @@
         <h2 id="game-over-title">GAME OVER</h2>
         <p id="game-over-desc">Zombies Win!</p>
         <button id="btn-back-lobby" class="btn primary">Back to Lobby</button>
+      </div>
+
+      <div id="settings-modal" class="modal hidden" style="width: min(90vw, 500px); padding: 2rem;">
+        <h2 style="font-size: 2rem; margin-bottom: 1.5rem; color: var(--accent-color);">Settings</h2>
+        
+        <div class="settings-section">
+          <label style="display: block; font-weight: bold; margin-bottom: 0.5rem; color: var(--text-secondary);">Camera Mode</label>
+          <div class="radio-group" style="display: flex; gap: 1rem; margin-bottom: 1.5rem;">
+            <button id="cam-mode-kart" class="btn secondary active" style="flex: 1;">Kart (Auto)</button>
+            <button id="cam-mode-manual" class="btn secondary" style="flex: 1;">Manual (Mouse)</button>
+          </div>
+        </div>
+
+        <div class="settings-section" style="margin-bottom: 2rem;">
+          <label style="display: block; font-weight: bold; margin-bottom: 1rem; color: var(--text-secondary);">Keybindings</label>
+          
+          <div class="keybind-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem; background: rgba(0,0,0,0.3); padding: 0.5rem 1rem; border-radius: 8px;">
+            <span>Infect / Action</span>
+            <button id="bind-action" class="btn-keybind" style="background: rgba(255,255,255,0.1); border: 1px solid var(--accent-color); color: white; border-radius: 6px; padding: 0.3rem 1rem; min-width: 80px;">E</button>
+          </div>
+          
+          <div class="keybind-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem; background: rgba(0,0,0,0.3); padding: 0.5rem 1rem; border-radius: 8px;">
+            <span>Jump</span>
+            <button id="bind-jump" class="btn-keybind" style="background: rgba(255,255,255,0.1); border: 1px solid var(--accent-color); color: white; border-radius: 6px; padding: 0.3rem 1rem; min-width: 80px;">Space</button>
+          </div>
+          
+          <div class="keybind-row" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.8rem; background: rgba(0,0,0,0.3); padding: 0.5rem 1rem; border-radius: 8px;">
+            <span>Slide</span>
+            <button id="bind-slide" class="btn-keybind" style="background: rgba(255,255,255,0.1); border: 1px solid var(--accent-color); color: white; border-radius: 6px; padding: 0.3rem 1rem; min-width: 80px;">Shift</button>
+          </div>
+        </div>
+
+        <button id="btn-close-settings" class="btn primary" style="width: 100%;">Close Settings</button>
       </div>
 
       <div id="debug-overlay" style="display: none;"></div>

@@ -300,6 +300,10 @@ input[type=range] {
   color: var(--text-primary);
 }
 .btn.secondary:hover { background-color: rgba(255, 255, 255, 0.05); border-color: var(--text-primary); }
+.btn.secondary.active { background-color: var(--accent-color); border-color: var(--accent-color); color: white; }
+.btn-keybind { cursor: pointer; transition: all 0.2s ease; }
+.btn-keybind:hover { background: rgba(255,255,255,0.2) !important; }
+.btn-keybind.listening { background: var(--warn-color) !important; border-color: var(--warn-color) !important; animation: pulse 1s infinite; }
 
 .btn:disabled, .btn.disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
 

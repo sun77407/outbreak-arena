@@ -41,6 +41,10 @@ export class Game {
     this.world = new World(this.scene);
     this.audio = new AudioManager();
 
+    this.settings = {
+      cameraMode: localStorage.getItem('cameraMode') || 'kart'
+    };
+
     this.players = new Map();
     this.localPlayerId = this.network.myId;
 
@@ -107,12 +111,81 @@ export class Game {
       }
     });
 
-    // Pointer Lock removed for automated follow camera
-
     document.getElementById('slot-speed')?.addEventListener('pointerdown', () => this.usePowerup('speed'));
     document.getElementById('slot-shield')?.addEventListener('pointerdown', () => this.usePowerup('shield'));
     document.getElementById('slot-trap')?.addEventListener('pointerdown', () => this.usePowerup('trap'));
     document.getElementById('btn-pause')?.addEventListener('click', () => this.togglePause());
+
+    this.initSettingsUI();
+  }
+
+  initSettingsUI() {
+    const modal = document.getElementById('settings-modal');
+    document.getElementById('btn-settings')?.addEventListener('click', () => {
+      modal.classList.remove('hidden');
+      this.setPaused(true, true); // Auto pause when settings are open
+    });
+    document.getElementById('btn-close-settings')?.addEventListener('click', () => {
+      modal.classList.add('hidden');
+      this.setPaused(false, true);
+    });
+
+    const btnKart = document.getElementById('cam-mode-kart');
+    const btnManual = document.getElementById('cam-mode-manual');
+    const updateCamBtns = () => {
+      if (this.settings.cameraMode === 'manual') {
+        btnManual.classList.add('active');
+        btnKart.classList.remove('active');
+      } else {
+        btnKart.classList.add('active');
+        btnManual.classList.remove('active');
+        if (document.pointerLockElement === this.renderer.domElement) {
+          document.exitPointerLock();
+        }
+      }
+    };
+    updateCamBtns();
+
+    btnKart?.addEventListener('click', () => { this.settings.cameraMode = 'kart'; localStorage.setItem('cameraMode', 'kart'); updateCamBtns(); });
+    btnManual?.addEventListener('click', () => { this.settings.cameraMode = 'manual'; localStorage.setItem('cameraMode', 'manual'); updateCamBtns(); });
+
+    // Pointer Lock for Manual Camera
+    this.renderer.domElement.addEventListener('click', () => {
+      if (this.isRunning && !this.isPaused && this.settings.cameraMode === 'manual') {
+        this.renderer.domElement.requestPointerLock();
+      }
+    });
+    document.addEventListener('mousemove', (e) => {
+      if (document.pointerLockElement === this.renderer.domElement && this.settings.cameraMode === 'manual') {
+        this.cameraYaw -= e.movementX * 0.002;
+      }
+    });
+
+    // Keybind logic
+    const setupBind = (actionId) => {
+      const btn = document.getElementById('bind-' + actionId);
+      if (!btn) return;
+      btn.textContent = this.input.keyBinds[actionId].toUpperCase();
+      btn.addEventListener('click', () => {
+        if (btn.classList.contains('listening')) return;
+        btn.classList.add('listening');
+        btn.textContent = '...';
+        
+        const onKey = (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const keyStr = e.code.toLowerCase() === 'space' ? 'space' : e.key.toLowerCase();
+          this.input.updateKeyBind(actionId, keyStr);
+          btn.textContent = keyStr.toUpperCase();
+          btn.classList.remove('listening');
+          window.removeEventListener('keydown', onKey, true);
+        };
+        window.addEventListener('keydown', onKey, true);
+      });
+    };
+    setupBind('action');
+    setupBind('jump');
+    setupBind('slide');
   }
 
   setCameraPOV(distance) {
@@ -742,7 +815,7 @@ export class Game {
       const currentSeq = this.network._inputSeq;
       // Update local player with client-side prediction
       const { move, action } = localPlayer.updateLocal(
-        dt, this.input, this.world, this.activePowerups, this.world.flatColliders, currentSeq, this.cameraYaw
+        dt, this.input, this.world, this.activePowerups, this.world.flatColliders, currentSeq, this.cameraYaw, this.settings.cameraMode
       );
 
       // Queue input for batching
@@ -762,15 +835,23 @@ export class Game {
       if (this.activePowerups.shield > 0) this.activePowerups.shield -= dt;
       if (this.activePowerups.aura > 0) this.activePowerups.aura -= dt;
 
-      // Camera follow (Automated Kart follow camera)
-      // Base the camera yaw strictly on the player's current visual rotation
-      const playerYaw = localPlayer.group.rotation.y;
+      // Camera follow
+      let camYaw = this.cameraYaw;
+      if (this.settings.cameraMode === 'kart') {
+        camYaw = localPlayer.group.rotation.y + Math.PI;
+      }
       
       const offset = new THREE.Vector3(
-        Math.sin(playerYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
+        Math.sin(camYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
         Math.sin(this.cameraPitch) * this.cameraDistance,
-        Math.cos(playerYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
+        Math.cos(camYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
       );
+      
+      if (this.settings.cameraMode === 'manual') {
+        // Shoulder offset: push right relative to yaw
+        const rightVec = new THREE.Vector3(Math.cos(this.cameraYaw), 0, -Math.sin(this.cameraYaw));
+        offset.add(rightVec.multiplyScalar(1.2));
+      }
       
       const targetCamPos = localPlayer.group.position.clone().add(offset);
       // Smoothly move camera
@@ -790,12 +871,21 @@ export class Game {
         }
         const target = alive[this.spectateIndex % alive.length];
         
-        const targetYaw = target.group.rotation.y;
+        let camYaw = this.cameraYaw;
+        if (this.settings.cameraMode === 'kart') {
+          camYaw = target.group.rotation.y + Math.PI;
+        }
+        
         const offset = new THREE.Vector3(
-          Math.sin(targetYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
+          Math.sin(camYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
           Math.sin(this.cameraPitch) * this.cameraDistance,
-          Math.cos(targetYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
+          Math.cos(camYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
         );
+        
+        if (this.settings.cameraMode === 'manual') {
+          const rightVec = new THREE.Vector3(Math.cos(this.cameraYaw), 0, -Math.sin(this.cameraYaw));
+          offset.add(rightVec.multiplyScalar(1.2));
+        }
         
         const targetCamPos = target.group.position.clone().add(offset);
         this.camera.position.lerp(targetCamPos, 10 * dt);

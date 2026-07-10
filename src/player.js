@@ -179,7 +179,7 @@ export class Player {
    * @param {number}   seq             current input sequence number (from network)
    * @returns {{ move, action }}
    */
-  updateLocal(dt, input, world, activePowerups, flatColliders, seq, cameraYaw = Math.PI) {
+  updateLocal(dt, input, world, activePowerups, flatColliders, seq, cameraYaw = Math.PI, cameraMode = 'kart') {
     if (activePowerups) {
       this.activePowerups.speed  = activePowerups.speed  > 0;
       this.activePowerups.shield = activePowerups.shield > 0;
@@ -243,21 +243,37 @@ export class Player {
       }
     }
 
-    // Kart Steering
-    if (rawMove.x !== 0) {
-      this.kartYaw -= rawMove.x * 4.0 * dt;
-    }
+    if (cameraMode === 'kart') {
+      // Kart Steering
+      if (rawMove.x !== 0) {
+        this.kartYaw -= rawMove.x * 4.0 * dt;
+      }
 
-    // Align character visual to kartYaw
-    let yawDiff = this.kartYaw - this.group.rotation.y;
-    while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
-    while (yawDiff > Math.PI)  yawDiff -= Math.PI * 2;
-    this.group.rotation.y += yawDiff * 15 * dt;
+      // Align character visual to kartYaw
+      let yawDiff = this.kartYaw - this.group.rotation.y;
+      while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+      while (yawDiff > Math.PI)  yawDiff -= Math.PI * 2;
+      this.group.rotation.y += yawDiff * 15 * dt;
 
-    if (rawMove.y !== 0) {
-      const speedMultiplier = -rawMove.y; // W is +1, S is -1
-      move.x = Math.sin(this.kartYaw) * speedMultiplier;
-      move.y = Math.cos(this.kartYaw) * speedMultiplier;
+      if (rawMove.y !== 0) {
+        const speedMultiplier = -rawMove.y; // W is +1, S is -1
+        move.x = Math.sin(this.kartYaw) * speedMultiplier;
+        move.y = Math.cos(this.kartYaw) * speedMultiplier;
+      }
+    } else {
+      // Manual Controls (Strafe relative to cameraYaw)
+      if (rawMove.x !== 0 || rawMove.y !== 0) {
+        const sin = Math.sin(cameraYaw);
+        const cos = Math.cos(cameraYaw);
+        move.x = rawMove.x * cos + rawMove.y * sin;
+        move.y = -rawMove.x * sin + rawMove.y * cos;
+        
+        const len = Math.sqrt(move.x * move.x + move.y * move.y);
+        if (len > 1) {
+          move.x /= len;
+          move.y /= len;
+        }
+      }
     }
 
     if (move.x !== 0 || move.y !== 0) {
@@ -274,7 +290,15 @@ export class Player {
       );
       this.group.position.x = result.x;
       this.group.position.z = result.z;
-      // RotY handled by kartYaw instead of predicting absolute direction snap
+      
+      if (cameraMode === 'manual' && result.rotY !== null) {
+        // Smooth rotation (same slerp as before)
+        let diff = result.rotY - this.group.rotation.y;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        while (diff > Math.PI)  diff -= Math.PI * 2;
+        this.group.rotation.y += diff * 10 * dt;
+        this.kartYaw = this.group.rotation.y; // keep kartYaw synced for mode switching
+      }
 
       if (!this.isJumping && !this.isSliding) {
         animToPlay = 'sprint';

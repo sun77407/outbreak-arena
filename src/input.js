@@ -7,6 +7,13 @@ export class InputManager {
     this.slidePressed = false;
     this.deadzone = 0.12;
     this.joystickRadius = 50;
+    
+    // Load Keybinds
+    this.keyBinds = {
+      action: localStorage.getItem('kb_action') || 'e',
+      jump: localStorage.getItem('kb_jump') || 'space',
+      slide: localStorage.getItem('kb_slide') || 'shift'
+    };
 
     this.onPause = null;   // Escape
     this.onMuteToggle = null; // M
@@ -18,6 +25,11 @@ export class InputManager {
     this.initKeyboard();
     this.initJoystick();
     this.initActionButtons();
+  }
+
+  updateKeyBind(action, key) {
+    this.keyBinds[action] = key.toLowerCase();
+    localStorage.setItem('kb_' + action, key.toLowerCase());
   }
 
   initKeyboard() {
@@ -34,12 +46,15 @@ export class InputManager {
         if (e.code === 'Escape') document.activeElement.blur();
         return;
       }
+      
       const k = keyMap[e.key.toLowerCase()];
       if (k) { this.keys[k] = true; e.preventDefault(); }
       
-      if (e.code === 'Space') { this.jumpPressed = true; e.preventDefault(); }
-      if (e.key === 'Shift') { this.slidePressed = true; e.preventDefault(); }
-      if (e.key.toLowerCase() === 'e') { this.actionPressed = true; e.preventDefault(); }
+      const keyStr = e.code.toLowerCase() === 'space' ? 'space' : e.key.toLowerCase();
+      
+      if (keyStr === this.keyBinds.jump) { this.jumpPressed = true; e.preventDefault(); }
+      if (keyStr === this.keyBinds.slide) { this.slidePressed = true; e.preventDefault(); }
+      if (keyStr === this.keyBinds.action) { this.actionPressed = true; e.preventDefault(); }
       
       if (e.code === 'Escape' && this.onPause) this.onPause();
       if ((e.key === 'm' || e.key === 'M') && this.onMuteToggle) this.onMuteToggle();
@@ -52,9 +67,11 @@ export class InputManager {
     window.addEventListener('keyup', (e) => {
       const k = keyMap[e.key.toLowerCase()];
       if (k) this.keys[k] = false;
-      if (e.code === 'Space') this.jumpPressed = false;
-      if (e.key === 'Shift') this.slidePressed = false;
-      if (e.key.toLowerCase() === 'e') this.actionPressed = false;
+      
+      const keyStr = e.code.toLowerCase() === 'space' ? 'space' : e.key.toLowerCase();
+      if (keyStr === this.keyBinds.jump) this.jumpPressed = false;
+      if (keyStr === this.keyBinds.slide) this.slidePressed = false;
+      if (keyStr === this.keyBinds.action) this.actionPressed = false;
     });
 
     // Prevent a stuck-key bug when the tab loses focus mid-press
