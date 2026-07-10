@@ -121,6 +121,35 @@ export class Game {
       }
     });
 
+    let lastTouchX = null;
+    document.addEventListener('touchstart', (e) => {
+      if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].clientX > window.innerWidth / 2) {
+          lastTouchX = e.changedTouches[i].clientX;
+        }
+      }
+    }, { passive: true });
+
+    document.addEventListener('touchmove', (e) => {
+      if (lastTouchX === null) return;
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].clientX > window.innerWidth / 2) {
+          const deltaX = e.changedTouches[i].clientX - lastTouchX;
+          this.cameraYaw -= deltaX * 0.005;
+          lastTouchX = e.changedTouches[i].clientX;
+        }
+      }
+    }, { passive: true });
+
+    document.addEventListener('touchend', (e) => {
+      for (let i = 0; i < e.changedTouches.length; i++) {
+        if (e.changedTouches[i].clientX > window.innerWidth / 2) {
+          lastTouchX = null;
+        }
+      }
+    }, { passive: true });
+
     document.getElementById('slot-speed')?.addEventListener('pointerdown', () => this.usePowerup('speed'));
     document.getElementById('slot-shield')?.addEventListener('pointerdown', () => this.usePowerup('shield'));
     document.getElementById('slot-trap')?.addEventListener('pointerdown', () => this.usePowerup('trap'));

@@ -59,9 +59,9 @@ export class NetworkManager {
   // Connection management
   // ---------------------------------------------------------------------------
   connectServer() {
-    let port = parseInt(window.location.port);
-    if (window.location.hostname === 'localhost' && port !== 3000) {
-      port = 3000;
+    let port = window.location.port ? parseInt(window.location.port) : (window.location.protocol === 'https:' ? 443 : 80);
+    if (port === 5173) {
+      port = 3000; // Map Vite dev server to Node backend
     }
     const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
     if (this.onSignalingStatus) this.onSignalingStatus(this.reconnectAttempts ? 'reconnecting' : 'connecting');

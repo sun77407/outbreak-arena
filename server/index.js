@@ -9,7 +9,7 @@ const { buildColliders, checkCollision, applyMove, makePRNG, ARENA_HALF } = requ
 
 const app = express();
 const server = http.createServer(app);
-const io = geckos();
+const io = geckos({ cors: { origin: '*', allowEIO3: true } });
 io.addServer(server);
 
 app.use(express.static(path.join(__dirname, '../dist')));
