@@ -1,11 +1,11 @@
 /**
- * predict.js — Client-side movement prediction mirror of server/world-server.js.
+ * predict.js - Client-side movement prediction mirror of server/world-server.js.
  *
  * CRITICAL: The math here must stay bit-for-bit identical to world-server.js.
- * Any divergence causes prediction drift ? reconciliation fires every tick.
+ * Any divergence causes prediction drift and reconciliation fires every tick.
  *
  * Uses flat collider format: { type:'sphere'|'box', cx, cz, r, hw, hd }
- * NOT Three.js Vector3 objects — so this module has zero Three.js dependency.
+ * NOT Three.js Vector3 objects - so this module has zero Three.js dependency.
  *
  * The flatColliders[] array is built by src/world.js alongside its Three.js
  * colliders[], so both share the same seeded-PRNG scatter sequence.
@@ -53,23 +53,54 @@ export function checkCollisionFlat(x, z, radius, colliders) {
  * @returns {{ x: number, z: number }}
  */
 export function applyMoveFlat(x, z, dx, dz, radius, colliders) {
-  const nx = x + dx;
-  const nz = z + dz;
+  let nx = x + dx;
+  let nz = z + dz;
 
   // Attempt full move
   if (!checkCollisionFlat(nx, nz, radius, colliders)) {
     return { x: nx, z: nz };
   }
-  // Slide along X axis
-  if (!checkCollisionFlat(nx, z, radius, colliders)) {
-    return { x: nx, z };
+
+  // Smooth penetration resolution (push-out)
+  let pushedX = nx;
+  let pushedZ = nz;
+
+  for (const c of colliders) {
+    if (c.type === 'sphere') {
+      const distX = pushedX - c.cx;
+      const distZ = pushedZ - c.cz;
+      const distSq = distX * distX + distZ * distZ;
+      const minDist = radius + c.r;
+      if (distSq < minDist * minDist) {
+        const dist = Math.sqrt(distSq) || 0.001;
+        const overlap = minDist - dist;
+        pushedX += (distX / dist) * overlap;
+        pushedZ += (distZ / dist) * overlap;
+      }
+    } else if (c.type === 'box') {
+      const dxRel = pushedX - c.cx;
+      const dzRel = pushedZ - c.cz;
+      const absX = Math.abs(dxRel);
+      const absZ = Math.abs(dzRel);
+      const overlapX = (c.hw + radius) - absX;
+      const overlapZ = (c.hd + radius) - absZ;
+      if (overlapX > 0 && overlapZ > 0) {
+        if (overlapX < overlapZ) {
+          pushedX += (dxRel > 0 ? overlapX : -overlapX);
+        } else {
+          pushedZ += (dzRel > 0 ? overlapZ : -overlapZ);
+        }
+      }
+    }
   }
-  // Slide along Z axis
-  if (!checkCollisionFlat(x, nz, radius, colliders)) {
-    return { x, z: nz };
-  }
-  // Fully blocked
-  return { x, z };
+
+  // Bounds check for arena
+  if (pushedX < -(ARENA_HALF - 1)) pushedX = -(ARENA_HALF - 1);
+  if (pushedX > (ARENA_HALF - 1)) pushedX = (ARENA_HALF - 1);
+  if (pushedZ < -(ARENA_HALF - 1)) pushedZ = -(ARENA_HALF - 1);
+  if (pushedZ > (ARENA_HALF - 1)) pushedZ = (ARENA_HALF - 1);
+
+  return { x: pushedX, z: pushedZ };
 }
 
 /**

@@ -107,48 +107,7 @@ export class Game {
       }
     });
 
-    // Pointer Lock for Mouse Look
-    this.renderer.domElement.addEventListener('click', () => {
-      if (this.isRunning && !this.isPaused) {
-        this.renderer.domElement.requestPointerLock();
-      }
-    });
-
-    document.addEventListener('mousemove', (e) => {
-      if (document.pointerLockElement === this.renderer.domElement) {
-        this.cameraYaw -= e.movementX * 0.002;
-        // Pitch is locked for shoulder-level view
-      }
-    });
-
-    let lastTouchX = null;
-    document.addEventListener('touchstart', (e) => {
-      if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT') return;
-      for (let i = 0; i < e.changedTouches.length; i++) {
-        if (e.changedTouches[i].clientX > window.innerWidth / 2) {
-          lastTouchX = e.changedTouches[i].clientX;
-        }
-      }
-    }, { passive: true });
-
-    document.addEventListener('touchmove', (e) => {
-      if (lastTouchX === null) return;
-      for (let i = 0; i < e.changedTouches.length; i++) {
-        if (e.changedTouches[i].clientX > window.innerWidth / 2) {
-          const deltaX = e.changedTouches[i].clientX - lastTouchX;
-          this.cameraYaw -= deltaX * 0.005;
-          lastTouchX = e.changedTouches[i].clientX;
-        }
-      }
-    }, { passive: true });
-
-    document.addEventListener('touchend', (e) => {
-      for (let i = 0; i < e.changedTouches.length; i++) {
-        if (e.changedTouches[i].clientX > window.innerWidth / 2) {
-          lastTouchX = null;
-        }
-      }
-    }, { passive: true });
+    // Pointer Lock removed for automated follow camera
 
     document.getElementById('slot-speed')?.addEventListener('pointerdown', () => this.usePowerup('speed'));
     document.getElementById('slot-shield')?.addEventListener('pointerdown', () => this.usePowerup('shield'));
@@ -803,15 +762,15 @@ export class Game {
       if (this.activePowerups.shield > 0) this.activePowerups.shield -= dt;
       if (this.activePowerups.aura > 0) this.activePowerups.aura -= dt;
 
-      // Camera follow (3rd person orbit with shoulder offset)
+      // Camera follow (Automated Kart follow camera)
+      // Base the camera yaw strictly on the player's current visual rotation
+      const playerYaw = localPlayer.group.rotation.y;
+      
       const offset = new THREE.Vector3(
-        Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
+        Math.sin(playerYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
         Math.sin(this.cameraPitch) * this.cameraDistance,
-        Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
+        Math.cos(playerYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
       );
-      // Shoulder offset: push right relative to yaw
-      const rightVec = new THREE.Vector3(Math.cos(this.cameraYaw), 0, -Math.sin(this.cameraYaw));
-      offset.add(rightVec.multiplyScalar(1.2));
       
       const targetCamPos = localPlayer.group.position.clone().add(offset);
       // Smoothly move camera
@@ -831,13 +790,12 @@ export class Game {
         }
         const target = alive[this.spectateIndex % alive.length];
         
+        const targetYaw = target.group.rotation.y;
         const offset = new THREE.Vector3(
-          Math.sin(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
+          Math.sin(targetYaw) * Math.cos(this.cameraPitch) * this.cameraDistance,
           Math.sin(this.cameraPitch) * this.cameraDistance,
-          Math.cos(this.cameraYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
+          Math.cos(targetYaw) * Math.cos(this.cameraPitch) * this.cameraDistance
         );
-        const rightVec = new THREE.Vector3(Math.cos(this.cameraYaw), 0, -Math.sin(this.cameraYaw));
-        offset.add(rightVec.multiplyScalar(1.2));
         
         const targetCamPos = target.group.position.clone().add(offset);
         this.camera.position.lerp(targetCamPos, 10 * dt);

@@ -3,6 +3,8 @@ export class InputManager {
     this.keys = { w: false, a: false, s: false, d: false };
     this.joystick = { x: 0, y: 0 };
     this.actionPressed = false;
+    this.jumpPressed = false;
+    this.slidePressed = false;
     this.deadzone = 0.12;
     this.joystickRadius = 50;
 
@@ -34,7 +36,11 @@ export class InputManager {
       }
       const k = keyMap[e.key.toLowerCase()];
       if (k) { this.keys[k] = true; e.preventDefault(); }
-      if (e.code === 'Space') { this.actionPressed = true; e.preventDefault(); }
+      
+      if (e.code === 'Space') { this.jumpPressed = true; e.preventDefault(); }
+      if (e.key === 'Shift') { this.slidePressed = true; e.preventDefault(); }
+      if (e.key.toLowerCase() === 'e') { this.actionPressed = true; e.preventDefault(); }
+      
       if (e.code === 'Escape' && this.onPause) this.onPause();
       if ((e.key === 'm' || e.key === 'M') && this.onMuteToggle) this.onMuteToggle();
       if (e.key === 'Enter' && this.onChatFocus) this.onChatFocus();
@@ -46,13 +52,17 @@ export class InputManager {
     window.addEventListener('keyup', (e) => {
       const k = keyMap[e.key.toLowerCase()];
       if (k) this.keys[k] = false;
-      if (e.code === 'Space') this.actionPressed = false;
+      if (e.code === 'Space') this.jumpPressed = false;
+      if (e.key === 'Shift') this.slidePressed = false;
+      if (e.key.toLowerCase() === 'e') this.actionPressed = false;
     });
 
     // Prevent a stuck-key bug when the tab loses focus mid-press
     window.addEventListener('blur', () => {
       this.keys.w = this.keys.a = this.keys.s = this.keys.d = false;
       this.actionPressed = false;
+      this.jumpPressed = false;
+      this.slidePressed = false;
       this.joystick.x = 0; this.joystick.y = 0;
     });
   }
@@ -131,17 +141,18 @@ export class InputManager {
   }
 
   initActionButtons() {
-    const btnAction = document.getElementById('btn-action');
-    if (!btnAction) return;
-    const press = () => {
-      this.actionPressed = true;
-      if (navigator.vibrate) navigator.vibrate(15);
+    const bindButton = (id, pressFn, releaseFn) => {
+      const btn = document.getElementById(id);
+      if (!btn) return;
+      btn.addEventListener('pointerdown', () => { pressFn(); if (navigator.vibrate) navigator.vibrate(15); });
+      btn.addEventListener('pointerup', releaseFn);
+      btn.addEventListener('pointercancel', releaseFn);
+      btn.addEventListener('pointerleave', releaseFn);
     };
-    const release = () => { this.actionPressed = false; };
-    btnAction.addEventListener('pointerdown', press);
-    btnAction.addEventListener('pointerup', release);
-    btnAction.addEventListener('pointercancel', release);
-    btnAction.addEventListener('pointerleave', release);
+
+    bindButton('btn-action', () => this.actionPressed = true, () => this.actionPressed = false);
+    bindButton('btn-jump', () => this.jumpPressed = true, () => this.jumpPressed = false);
+    bindButton('btn-slide', () => this.slidePressed = true, () => this.slidePressed = false);
   }
 
   getMovement() {

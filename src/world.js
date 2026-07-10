@@ -115,7 +115,7 @@ export class World {
     const pumpkinGltf = this.assets.pumpkinModel;
 
     // Pass the seed so every client with the same room code gets the same layout
-    this.scatterObstacles([graveGltf.scene, treeGltf.scene, fallTreeGltf.scene, pumpkinGltf], 90, seed);
+    this.scatterObstacles([graveGltf.scene, treeGltf.scene, fallTreeGltf.scene, pumpkinGltf], 40, seed);
 
     this.colliders.push({ type: 'bounds', half: ARENA_HALF });
 

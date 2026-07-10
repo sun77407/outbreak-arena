@@ -42,6 +42,13 @@ export class Player {
     this.isDead = false;
     this.isExtracted = false;
     this.actionCooldown = 0;
+    this.jumpCooldown = 0;
+    this.slideCooldown = 0;
+    this.isJumping = false;
+    this.isSliding = false;
+    this.jumpTimer = 0;
+    this.slideTimer = 0;
+    this.kartYaw = Math.PI; // default facing direction
     this._footstepTimer = 0;
 
     this.onFootstep = null;
@@ -195,21 +202,62 @@ export class Player {
 
     if (this.actionCooldown > 0) this.actionCooldown -= dt;
 
+    if (this.jumpCooldown > 0) this.jumpCooldown -= dt;
+    if (this.slideCooldown > 0) this.slideCooldown -= dt;
+
+    if (input.jumpPressed && this.jumpCooldown <= 0 && !this.isJumping) {
+      this.isJumping = true;
+      this.jumpTimer = 0.8;
+      this.jumpCooldown = 3.0;
+    }
+    
+    if (input.slidePressed && this.slideCooldown <= 0 && !this.isSliding) {
+      this.isSliding = true;
+      this.slideTimer = 1.0;
+      this.slideCooldown = 3.0;
+    }
+
     let animToPlay = 'idle';
     const rawMove = input.getMovement();
     const move = { x: 0, y: 0 };
 
-    if (rawMove.x !== 0 || rawMove.y !== 0) {
-      const sin = Math.sin(cameraYaw);
-      const cos = Math.cos(cameraYaw);
-      move.x = rawMove.x * cos + rawMove.y * sin;
-      move.y = -rawMove.x * sin + rawMove.y * cos;
-
-      const len = Math.sqrt(move.x * move.x + move.y * move.y);
-      if (len > 1) {
-        move.x /= len;
-        move.y /= len;
+    if (this.isJumping) {
+      this.jumpTimer -= dt;
+      if (this.jumpTimer <= 0) {
+        this.isJumping = false;
+        this.group.position.y = 0;
+      } else {
+        this.group.position.y = Math.sin(Math.PI * (0.8 - this.jumpTimer) / 0.8) * 1.5;
+        animToPlay = 'jump';
       }
+    } else {
+      this.group.position.y = 0;
+    }
+
+    if (this.isSliding) {
+      this.slideTimer -= dt;
+      if (this.slideTimer <= 0) {
+        this.isSliding = false;
+      } else {
+        if (!this.isJumping) animToPlay = 'crouch';
+      }
+    }
+
+    // Kart Steering
+    if (rawMove.x !== 0) {
+      this.kartYaw -= rawMove.x * 4.0 * dt;
+    }
+
+    // Align character visual to kartYaw
+    let yawDiff = this.kartYaw - this.group.rotation.y;
+    while (yawDiff < -Math.PI) yawDiff += Math.PI * 2;
+    while (yawDiff > Math.PI)  yawDiff -= Math.PI * 2;
+    this.group.rotation.y += yawDiff * 15 * dt;
+
+    if (rawMove.y !== 0) {
+      const speedMultiplier = -rawMove.y; // W is +1, S is -1
+      move.x = Math.sin(this.kartYaw) * speedMultiplier;
+      move.y = Math.cos(this.kartYaw) * speedMultiplier;
     }
 
     if (move.x !== 0 || move.y !== 0) {
@@ -226,15 +274,11 @@ export class Player {
       );
       this.group.position.x = result.x;
       this.group.position.z = result.z;
-      if (result.rotY !== null) {
-        // Smooth rotation (same slerp as before)
-        let diff = result.rotY - this.group.rotation.y;
-        while (diff < -Math.PI) diff += Math.PI * 2;
-        while (diff > Math.PI)  diff -= Math.PI * 2;
-        this.group.rotation.y += diff * 10 * dt;
-      }
+      // RotY handled by kartYaw instead of predicting absolute direction snap
 
-      animToPlay = 'sprint';
+      if (!this.isJumping && !this.isSliding) {
+        animToPlay = 'sprint';
+      }
       this._footstepTimer -= dt;
       if (this._footstepTimer <= 0) {
         this.onFootstep?.(this);

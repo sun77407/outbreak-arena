@@ -61,8 +61,8 @@ function buildColliders(seed) {
     colliders.push({ type: 'box', cx: w.cx, cz: w.cz, hw: w.hw, hd: w.hd });
   }
 
-  // Scattered obstacles (90 attempts, same as world.js scatterObstacles count)
-  const OBSTACLE_COUNT = 90;
+  // Scattered obstacles (40 attempts, reduced from 90 to reduce clutter)
+  const OBSTACLE_COUNT = 40;
   const placed = [];
   const MIN_DIST_SQ = 3.5 * 3.5;
 
@@ -129,22 +129,54 @@ function checkCollision(x, z, radius, colliders) {
 // Returns the new { x, z } after collision resolution.
 // ---------------------------------------------------------------------------
 function applyMove(x, z, dx, dz, radius, colliders) {
-  const nx = x + dx;
-  const nz = z + dz;
+  let nx = x + dx;
+  let nz = z + dz;
 
+  // Try full move
   if (!checkCollision(nx, nz, radius, colliders)) {
     return { x: nx, z: nz };
   }
-  // Slide along X
-  if (!checkCollision(nx, z, radius, colliders)) {
-    return { x: nx, z };
+
+  // Smooth penetration resolution (push-out)
+  let pushedX = nx;
+  let pushedZ = nz;
+
+  for (const c of colliders) {
+    if (c.type === 'sphere') {
+      const distX = pushedX - c.cx;
+      const distZ = pushedZ - c.cz;
+      const distSq = distX * distX + distZ * distZ;
+      const minDist = radius + c.r;
+      if (distSq < minDist * minDist) {
+        const dist = Math.sqrt(distSq) || 0.001;
+        const overlap = minDist - dist;
+        pushedX += (distX / dist) * overlap;
+        pushedZ += (distZ / dist) * overlap;
+      }
+    } else if (c.type === 'box') {
+      const dxRel = pushedX - c.cx;
+      const dzRel = pushedZ - c.cz;
+      const absX = Math.abs(dxRel);
+      const absZ = Math.abs(dzRel);
+      const overlapX = (c.hw + radius) - absX;
+      const overlapZ = (c.hd + radius) - absZ;
+      if (overlapX > 0 && overlapZ > 0) {
+        if (overlapX < overlapZ) {
+          pushedX += (dxRel > 0 ? overlapX : -overlapX);
+        } else {
+          pushedZ += (dzRel > 0 ? overlapZ : -overlapZ);
+        }
+      }
+    }
   }
-  // Slide along Z
-  if (!checkCollision(x, nz, radius, colliders)) {
-    return { x, z: nz };
-  }
-  // Fully blocked
-  return { x, z };
+
+  // Bounds
+  if (pushedX < -(ARENA_HALF - 1)) pushedX = -(ARENA_HALF - 1);
+  if (pushedX > (ARENA_HALF - 1)) pushedX = (ARENA_HALF - 1);
+  if (pushedZ < -(ARENA_HALF - 1)) pushedZ = -(ARENA_HALF - 1);
+  if (pushedZ > (ARENA_HALF - 1)) pushedZ = (ARENA_HALF - 1);
+
+  return { x: pushedX, z: pushedZ };
 }
 
 // ---------------------------------------------------------------------------
