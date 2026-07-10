@@ -27,8 +27,8 @@ export class Game {
 
     this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
     this.cameraYaw = Math.PI; // Face "forward"
-    this.cameraPitch = Math.PI / 16; // Look slightly down, fixed for shoulder view
-    this.cameraDistance = 5;
+    const savedCam = localStorage.getItem('cameraHeight');
+    this.setCameraPOV(savedCam ? parseFloat(savedCam) : 6.0);
 
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     this.renderer.setSize(window.innerWidth, window.innerHeight);
@@ -125,6 +125,11 @@ export class Game {
     document.getElementById('slot-shield')?.addEventListener('pointerdown', () => this.usePowerup('shield'));
     document.getElementById('slot-trap')?.addEventListener('pointerdown', () => this.usePowerup('trap'));
     document.getElementById('btn-pause')?.addEventListener('click', () => this.togglePause());
+  }
+
+  setCameraPOV(distance) {
+    this.cameraDistance = distance;
+    this.cameraPitch = (Math.PI / 16) + (distance - 5) * 0.02;
   }
 
   // ---- Start / Stop ----

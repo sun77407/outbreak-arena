@@ -111,6 +111,7 @@ export class World {
     const graveGltf = await this.loader.loadAsync('/assets/Models/GLB format/gravestone-cross.glb');
     const treeGltf = await this.loader.loadAsync('/assets/Models/GLB format/pine.glb');
     const fallTreeGltf = await this.loader.loadAsync('/assets/Models/GLB format/pine-fall.glb');
+    const fenceGltf = await this.loader.loadAsync('/assets/Models/GLB format/fence.glb');
     const pumpkinGltf = this.assets.pumpkinModel;
 
     // Pass the seed so every client with the same room code gets the same layout
@@ -118,23 +119,35 @@ export class World {
 
     this.colliders.push({ type: 'bounds', half: ARENA_HALF });
 
-    this.buildInnerMazes();
+    this.buildInnerMazes(fenceGltf.scene);
   }
 
-  buildInnerMazes() {
-    const wallMat = new THREE.MeshStandardMaterial({ color: 0x223344, roughness: 0.8, metalness: 0.2 });
-
+  buildInnerMazes(fenceModel) {
     const buildWall = (cx, cz, w, d) => {
-      const geo = new THREE.BoxGeometry(w, 4, d);
-      const mesh = new THREE.Mesh(geo, wallMat);
-      mesh.position.set(cx, 2, cz);
-      mesh.castShadow = true;
-      mesh.receiveShadow = true;
-      this.scene.add(mesh);
       const hw = w / 2, hd = d / 2;
       this.colliders.push({ type: 'box', cx, cz, hw, hd });
       this.flatColliders.push({ type: 'box', cx, cz, hw, hd }); // prediction mirror
       this.mapProps.push({ x: cx, z: cz, isWall: true, w, d });
+
+      const FENCE_SIZE = 2.0; 
+      if (w > d) {
+        const count = Math.ceil(w / FENCE_SIZE);
+        for (let i = 0; i < count; i++) {
+          const m = SkeletonUtils.clone(fenceModel);
+          m.position.set(cx - w/2 + (i + 0.5) * FENCE_SIZE, 0, cz);
+          m.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+          this.scene.add(m);
+        }
+      } else {
+        const count = Math.ceil(d / FENCE_SIZE);
+        for (let i = 0; i < count; i++) {
+          const m = SkeletonUtils.clone(fenceModel);
+          m.position.set(cx, 0, cz - d/2 + (i + 0.5) * FENCE_SIZE);
+          m.rotation.y = Math.PI / 2;
+          m.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+          this.scene.add(m);
+        }
+      }
     };
 
     // Must match MAZE_WALLS in server/world-server.js exactly
@@ -155,17 +168,38 @@ export class World {
     const rng = makePRNG(seed);
     const cosmeticRng = makePRNG(seed + '_model');
 
+    const placed = [];
+    const MIN_DIST_SQ = 3.5 * 3.5;
+
     for (let i = 0; i < count; i++) {
       const srcIdx = Math.floor(cosmeticRng() * sources.length);
       const source = sources[srcIdx];
       const model = SkeletonUtils.clone(source);
 
-      const x = (rng() - 0.5) * 44;
-      const z = (rng() - 0.5) * 44;
-      const rotY = rng() * Math.PI * 2;
-      const scaleJitter = 0.85 + rng() * 0.4;
+      let x, z, rotY, scaleJitter, valid = false;
 
-      if (Math.abs(x) < 5 && Math.abs(z) < 5) continue;
+      for (let attempts = 0; attempts < 30; attempts++) {
+        x = (rng() - 0.5) * 44;
+        z = (rng() - 0.5) * 44;
+        rotY = rng() * Math.PI * 2;
+        scaleJitter = 0.85 + rng() * 0.4;
+
+        if (Math.abs(x) < 5 && Math.abs(z) < 5) continue;
+
+        valid = true;
+        for (const p of placed) {
+          const dx = p.x - x;
+          const dz = p.z - z;
+          if (dx * dx + dz * dz < MIN_DIST_SQ) {
+            valid = false;
+            break;
+          }
+        }
+        if (valid) break;
+      }
+
+      if (!valid) continue;
+      placed.push({ x, z });
 
 
 

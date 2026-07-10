@@ -6,10 +6,11 @@
  * Public API intentionally kept compatible with the old version
  * (same callback names) so main.js changes are minimal.
  */
+import geckos from '@geckos.io/client';
 
 export class NetworkManager {
   constructor() {
-    this.ws = null;
+    this.channel = null;
     this.roomCode = null;
     this.myId = Math.random().toString(36).substr(2, 9);
     this.myName = 'Survivor';
@@ -47,7 +48,7 @@ export class NetworkManager {
 
     // Client-initiated ping for UI
     this._pingInterval = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      if (this.channel) {
         this._lastPingSent = performance.now();
         this._send({ type: 'client_ping' });
       }
@@ -58,34 +59,41 @@ export class NetworkManager {
   // Connection management
   // ---------------------------------------------------------------------------
   connectServer() {
-    let wsHost = window.location.host;
-    if (window.location.hostname === 'localhost' && window.location.port !== '3000') {
-      wsHost = 'localhost:3000';
+    let port = parseInt(window.location.port);
+    if (window.location.hostname === 'localhost' && port !== 3000) {
+      port = 3000;
     }
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
     if (this.onSignalingStatus) this.onSignalingStatus(this.reconnectAttempts ? 'reconnecting' : 'connecting');
 
-    this.ws = new WebSocket(`${protocol}//${wsHost}`);
+    this.channel = geckos({ 
+      url: `${protocol}//${window.location.hostname}`, 
+      port: port || (protocol === 'https:' ? 443 : 80)
+    });
 
-    this.ws.onopen = () => {
+    this.channel.onConnect((error) => {
+      if (error) {
+        console.error(error.message);
+        if (!this._manualClose) this._tryReconnect();
+        return;
+      }
       this.reconnectAttempts = 0;
       if (this.onSignalingStatus) this.onSignalingStatus('connected');
-      console.log('Connected to game server');
-    };
+      console.log('Connected to game server via Geckos WebRTC');
 
-    this.ws.onmessage = (event) => {
-      let data;
-      try { data = JSON.parse(event.data); } catch { return; }
-      this._handleMessage(data);
-    };
+      this.channel.on('msg', (data) => {
+        if (typeof data === 'string') {
+          try { data = JSON.parse(data); } catch { return; }
+        }
+        this._handleMessage(data);
+      });
+    });
 
-    this.ws.onclose = () => {
+    this.channel.onDisconnect(() => {
       console.log('Disconnected from game server');
       if (this._manualClose) return;
       this._tryReconnect();
-    };
-
-    this.ws.onerror = () => { /* onclose fires after */ };
+    });
   }
 
   _tryReconnect() {
@@ -217,8 +225,8 @@ export class NetworkManager {
   // Internal send helper
   // ---------------------------------------------------------------------------
   _send(data) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      try { this.ws.send(JSON.stringify(data)); } catch { /* ignore */ }
+    if (this.channel) {
+      try { this.channel.emit('msg', data); } catch { /* ignore */ }
     }
   }
 
@@ -270,7 +278,7 @@ export class NetworkManager {
 
   close() {
     this._manualClose = true;
-    if (this.ws) this.ws.close();
+    if (this.channel) this.channel.close();
   }
 
   // ---------------------------------------------------------------------------

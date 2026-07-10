@@ -225,6 +225,17 @@ function init() {
     network.startGame(hostRoundTime);
   });
 
+  const cameraHeightInput = document.getElementById('input-camera-height');
+  if (cameraHeightInput) {
+    const saved = localStorage.getItem('cameraHeight');
+    if (saved) cameraHeightInput.value = saved;
+    cameraHeightInput.addEventListener('input', (e) => {
+      const val = parseFloat(e.target.value);
+      localStorage.setItem('cameraHeight', val);
+      if (game) game.setCameraPOV(val);
+    });
+  }
+
   const roundTimerInput = document.getElementById('round-timer-input');
   const roundTimerVal = document.getElementById('round-timer-val');
   if (roundTimerInput) {

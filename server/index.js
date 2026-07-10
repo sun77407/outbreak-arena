@@ -3,13 +3,14 @@
 const crypto = require('crypto');
 const express = require('express');
 const http = require('http');
-const { WebSocketServer } = require('ws');
+const { geckos } = require('@geckos.io/server');
 const path = require('path');
 const { buildColliders, checkCollision, applyMove, makePRNG, ARENA_HALF } = require('./world-server');
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const io = geckos();
+io.addServer(server);
 
 app.use(express.static(path.join(__dirname, '../dist')));
 app.use('/assets', express.static(path.join(__dirname, '../assets')));
@@ -31,16 +32,15 @@ const TRAP_TRIGGER_RADIUS = 1.0;
 // Utility
 // ---------------------------------------------------------------------------
 function safeSend(ws, payload) {
-  if (ws && ws.readyState === ws.OPEN) {
-    try { ws.send(JSON.stringify(payload)); } catch (e) { /* ignore */ }
+  if (ws) {
+    try { ws.emit('msg', payload); } catch (e) { /* ignore */ }
   }
 }
 
 function broadcast(clients, payload, excludeId = null) {
-  const str = JSON.stringify(payload);
   for (const ws of clients) {
-    if (ws.playerId !== excludeId && ws.readyState === ws.OPEN) {
-      try { ws.send(str); } catch { /* ignore */ }
+    if (ws.playerId !== excludeId) {
+      try { ws.emit('msg', payload); } catch { /* ignore */ }
     }
   }
 }
@@ -386,23 +386,18 @@ function closeRoom(code, reason) {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket connection handler
+// Connection handler
 // ---------------------------------------------------------------------------
-wss.on('connection', (ws) => {
-  // Disable Nagle's algorithm: each snapshot/event gets its own TCP segment immediately
-  // instead of being buffered for up to 200ms. Zero risk, meaningful jitter reduction.
-  ws._socket.setNoDelay(true);
-
+io.onConnection((ws) => {
   // Bug #2 fix: use cryptographically-secure server-generated ID (16 hex chars)
   ws.playerId = crypto.randomBytes(8).toString('hex');
   ws.roomCode = null;
-  ws.isAlive = true;
 
-  ws.on('pong', () => { ws.isAlive = true; });
-
-  ws.on('message', (raw) => {
-    let data;
-    try { data = JSON.parse(raw); } catch { return; }
+  ws.on('msg', (raw) => {
+    let data = raw;
+    if (typeof raw === 'string') {
+      try { data = JSON.parse(raw); } catch { return; }
+    }
 
     try {
       switch (data.type) {
@@ -555,7 +550,7 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', () => {
+  ws.onDisconnect(() => {
     const room = rooms.get(ws.roomCode);
     if (!room) return;
     const wasHost = (ws.playerId === room.hostId);
@@ -576,8 +571,6 @@ wss.on('connection', (ws) => {
       }
     }
   });
-
-  ws.on('error', (e) => console.error('WS error', e));
 });
 
 // ---------------------------------------------------------------------------
@@ -667,21 +660,7 @@ function handlePowerupUse(room, player, powerupType, trapId, trapX, trapZ) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Heartbeat to detect dead sockets
-// ---------------------------------------------------------------------------
-const heartbeat = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 30000);
-
-wss.on('close', () => clearInterval(heartbeat));
-
 process.on('SIGTERM', () => {
-  clearInterval(heartbeat);
   server.close(() => process.exit(0));
 });
 

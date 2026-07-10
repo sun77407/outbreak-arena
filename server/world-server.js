@@ -63,13 +63,34 @@ function buildColliders(seed) {
 
   // Scattered obstacles (90 attempts, same as world.js scatterObstacles count)
   const OBSTACLE_COUNT = 90;
-  for (let i = 0; i < OBSTACLE_COUNT; i++) {
-    const x = (rng() - 0.5) * 44;
-    const z = (rng() - 0.5) * 44;
-    const rotY = rng() * Math.PI * 2;   // consumed but not used server-side
-    const scaleJitter = 0.85 + rng() * 0.4;
+  const placed = [];
+  const MIN_DIST_SQ = 3.5 * 3.5;
 
-    if (Math.abs(x) < 5 && Math.abs(z) < 5) continue; // same skip as client
+  for (let i = 0; i < OBSTACLE_COUNT; i++) {
+    let x, z, rotY, scaleJitter, valid = false;
+
+    for (let attempts = 0; attempts < 30; attempts++) {
+      x = (rng() - 0.5) * 44;
+      z = (rng() - 0.5) * 44;
+      rotY = rng() * Math.PI * 2;   // consumed but not used server-side
+      scaleJitter = 0.85 + rng() * 0.4;
+
+      if (Math.abs(x) < 5 && Math.abs(z) < 5) continue;
+
+      valid = true;
+      for (const p of placed) {
+        const dx = p.x - x;
+        const dz = p.z - z;
+        if (dx * dx + dz * dz < MIN_DIST_SQ) {
+          valid = false;
+          break;
+        }
+      }
+      if (valid) break;
+    }
+
+    if (!valid) continue;
+    placed.push({ x, z });
 
     // Tighter radius (0.25) so players can slip between trees without getting stuck
     colliders.push({ type: 'sphere', cx: x, cz: z, r: 0.25 * scaleJitter });
